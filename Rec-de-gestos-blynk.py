@@ -1,4 +1,3 @@
-
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import tkinter as tk
@@ -7,13 +6,11 @@ import requests
 from functools import partial
 from datetime import datetime
 from collections import deque
-import matplotlib
-matplotlib.use('TkAgg')
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
 import threading
 import os
 import platform
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # --- Reconhecimento de gestos (opcional: OpenCV + MediaPipe) ---
 try:
@@ -36,12 +33,18 @@ except Exception:
 # preview UI widget (inicializado depois que controls_frame existir)
 preview_label = None
 
+# Variáveis de UI para mostrar o gesto atual e a ação tomada (inicializadas após root existir)
+current_gesture_var = None
+current_action_var = None
+
 # Variáveis de controle do reconhecimento
 gesture_thread = None
 gesture_running = False
 gesture_hold_count = 0
 gesture_last_detected = None
 GESTURE_HOLD_THRESHOLD = 6  # frames consecutivos para confirmar um gesto
+# Histórico curto para estabilizar detecções por frame (reduz flicker entre 1/2)
+detection_history = deque(maxlen=8)
 
 BLYNK_TOKEN = '_Cm7fdhv3ndn2LobfQwCxsgn4cTNxO1d'
 BLYNK_URL_GET = f'https://blynk.cloud/external/api/getAll?token={BLYNK_TOKEN}'
@@ -67,17 +70,23 @@ icones = {
 }
 ESTADO = {}
 
-# Histórico para o gráfico
-historico_horas = deque(maxlen=100)
-historico_temp = deque(maxlen=100)
-historico_umid = deque(maxlen=100)
+
 
 # Inicialização da janela principal com tema ttkbootstrap
-root = tb.Window(themename="yeti")
+root = tb.Window(themename="litera")  # Tema mais claro e moderno
 root.title("Automação Residencial - Blynk")
 root.geometry("1100x700")
 root.minsize(600, 600)
 root.resizable(True, True)
+
+# Configurar estilos para interface clara
+style = root.style
+style.configure(".", background="white")  # Configuração global
+style.configure("TNotebook", background="white")
+style.configure("TNotebook.Tab", background="white")
+style.configure("TFrame", background="white")
+style.configure("TLabelframe", background="white")
+style.configure("TLabelframe.Label", background="white")
 
 setpoint_temp = tk.DoubleVar(value=30.0)
 setpoint_umid = tk.DoubleVar(value=70.0)
@@ -169,16 +178,19 @@ plan_canvas.create_text((s_coords[0]+s_coords[2])//2, s_coords[1]+14, text="SALA
 # Corredor (centro)
 c_coords = (20, 190, 500, 260)
 plan_canvas.create_rectangle(*c_coords, fill='#ffffff', outline='#666666', width=2)
-plan_canvas.create_text((c_coords[0]+c_coords[2])//2, c_coords[1]+14, text="CORREDOR", font=("Segoe UI", 12, "bold"))
+plan_canvas.create_text((c_coords[0]+c_coords[2])//2, c_coords[1]+20, text="CORREDOR", font=("Segoe UI", 12, "bold"))
 
 # Garagem (inferior)
 g_coords = (20, 280, 500, 350)
 plan_canvas.create_rectangle(*g_coords, fill='#ffffff', outline='#666666', width=2)
-plan_canvas.create_text((g_coords[0]+g_coords[2])//2, g_coords[1]+14, text="GARAGEM", font=("Segoe UI", 12, "bold"))
+plan_canvas.create_text((g_coords[0]+g_coords[2])//2, g_coords[1]+20, text="GARAGEM", font=("Segoe UI", 12, "bold"))
 
 # Espaço para controles à direita do canvas (opcional)
 controls_frame = tb.Frame(frame_plan)
 controls_frame.pack(side='left', fill='y', padx=8)
+
+# NOTE: o preview + painel de debug serão inseridos em uma linha (preview_row)
+preview_row = None
 
 def alternar_estado(vpin):
     if vpin == 'v10':
@@ -352,6 +364,7 @@ def stop_preview_capture():
 def preview_loop():
     """Loop chamado via root.after que captura um frame, atualiza previews e executa detecção leve."""
     global preview_cap, preview_hands, gesture_hold_count, gesture_last_detected
+    global current_gesture_var, current_action_var
     if not preview_running or preview_cap is None:
         return
     try:
@@ -377,7 +390,14 @@ def preview_loop():
                 results = preview_hands.process(rgb)
                 if results and results.multi_hand_landmarks:
                     hand = results.multi_hand_landmarks[0]
-                    detected = _gesture_count_fingers(hand, None)
+                    # tenta obter handedness (Left/Right) se disponível
+                    handedness_label = None
+                    try:
+                        if results.multi_handedness and len(results.multi_handedness) > 0:
+                            handedness_label = results.multi_handedness[0].classification[0].label
+                    except Exception:
+                        handedness_label = None
+                    detected = _gesture_count_fingers(hand, handedness_label)
                     if preview_draw_landmarks.get():
                         try:
                             mp.solutions.drawing_utils.draw_landmarks(annotated, hand, mp.solutions.hands.HAND_CONNECTIONS)
@@ -386,6 +406,34 @@ def preview_loop():
             except Exception as e:
                 # falha no processing não impede preview
                 print("MediaPipe processing error:", e)
+
+        # Estabiliza detecção por histórico curto para reduzir flutuação
+        stable_detected = None
+        try:
+            # append valor simples (None também entra)
+            detection_history.append(detected)
+            # calcula moda simples
+            from collections import Counter
+            cnt = Counter(detection_history)
+            most_common, most_count = cnt.most_common(1)[0]
+            # exige ao menos 4 ocorrências na janela para considerar estável
+            if most_common is not None and most_count >= 4:
+                stable_detected = most_common
+            else:
+                # se 'None' for a moda com contagem alta, mantemos None
+                if most_common is None and most_count >= 4:
+                    stable_detected = None
+                else:
+                    stable_detected = None
+        except Exception:
+            stable_detected = detected
+
+        # Atualiza variável de UI com o gesto estabilizado (pode ser None)
+        try:
+            if current_gesture_var is not None:
+                current_gesture_var.set(str(stable_detected) if stable_detected is not None else 'Nenhum')
+        except Exception:
+            pass
 
         # atualizar small preview (usar frame anotado com landmarks se desenhado)
         try:
@@ -412,17 +460,25 @@ def preview_loop():
 
         # debouncing da detecção e acionamento
         try:
-            if detected is not None:
-                if detected == gesture_last_detected:
+            # usar a detecção estabilizada (stable_detected) para o debouncing/acionamento
+            if stable_detected is not None:
+                if stable_detected == gesture_last_detected:
                     gesture_hold_count += 1
                 else:
                     gesture_hold_count = 1
-                    gesture_last_detected = detected
+                    gesture_last_detected = stable_detected
                 if gesture_hold_count >= GESTURE_HOLD_THRESHOLD:
-                    trigger_gesture_action(detected)
+                    # antes de acionar, atualiza ação e chama o trigger
+                    try:
+                        if current_action_var is not None:
+                            current_action_var.set('Executando...')
+                    except Exception:
+                        pass
+                    trigger_gesture_action(stable_detected)
                     gesture_hold_count = 0
                     gesture_last_detected = None
             else:
+                # se não há detecção estável, reseta o contador
                 gesture_hold_count = 0
                 gesture_last_detected = None
         except Exception:
@@ -493,11 +549,38 @@ def close_preview_window():
 
 
 # Small preview (below PORTAO/MESTRE)
-preview_small_frame = tb.Frame(controls_frame, width=preview_width_var.get(), height=preview_height_var.get())
-preview_small_frame.pack(pady=(8,6))
+# Cria uma linha que conterá o preview pequeno e o painel de debug ao lado
+preview_row = tb.Frame(controls_frame)
+preview_row.pack(pady=(8,6))
+
+# Preview (pequeno) dentro da linha
+preview_small_frame = tb.Frame(preview_row, width=preview_width_var.get(), height=preview_height_var.get())
+preview_small_frame.pack(side='left')
 preview_small_frame.pack_propagate(False)
 preview_label = tk.Label(preview_small_frame, text="Preview\n(inativo)", bg="#000", fg="#fff")
 preview_label.pack(fill='both', expand=True)
+
+# Painel de debug ao lado do preview: mostra gesto detectado e ação tomada
+debug_frame = tb.Frame(preview_row, width=200, height=preview_height_var.get(), padding=6)
+debug_frame.pack(side='left', padx=(8,0))
+debug_frame.pack_propagate(False)
+
+# Inicializar as StringVars de debug (agora que root existe)
+try:
+    current_gesture_var = tk.StringVar(value='Nenhum')
+    current_action_var = tk.StringVar(value='Nenhuma ação')
+except Exception:
+    current_gesture_var = None
+    current_action_var = None
+
+tb.Label(debug_frame, text="Debug Gestos", font=("Segoe UI", 10, 'bold')).pack(anchor='nw')
+tb.Separator(debug_frame, orient='horizontal').pack(fill='x', pady=4)
+tb.Label(debug_frame, text="Gesto detectado:", font=("Segoe UI", 9)).pack(anchor='w')
+lbl_gesto = tb.Label(debug_frame, textvariable=current_gesture_var, font=("Segoe UI", 11, 'bold'))
+lbl_gesto.pack(anchor='w', pady=(0,6))
+tb.Label(debug_frame, text="Ação tomada:", font=("Segoe UI", 9)).pack(anchor='w')
+lbl_acao = tb.Label(debug_frame, textvariable=current_action_var, font=("Segoe UI", 10))
+lbl_acao.pack(anchor='w')
 
 # Controls para ajustar tamanho do preview (largura x altura)
 size_frame = tb.Frame(controls_frame)
@@ -524,39 +607,15 @@ camera_index_var.trace_add('write', lambda *a: _on_camera_index_change())
 preview_width_var.trace_add('write', lambda *a: preview_small_frame.config(width=int(preview_width_var.get())))
 preview_height_var.trace_add('write', lambda *a: preview_small_frame.config(height=int(preview_height_var.get())))
 
-# --- Aba Dashboards ---
-frame_dash = ttk.Frame(notebook)
-notebook.add(frame_dash, text="Dashboards")
 
-# Filtros de data/hora
-frame_filtros = tb.LabelFrame(frame_dash, text="Filtros", bootstyle="secondary", padding=10)
-frame_filtros.pack(fill='x', pady=10, padx=10)
 
-filtro_tipo = tk.StringVar(value="dia")
-filtro_data = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
 
-tb.Label(frame_filtros, text="Tipo:").pack(side='left', padx=5)
-combo_tipo = tb.Combobox(frame_filtros, values=["hora", "dia", "mes", "ano"], textvariable=filtro_tipo, width=8, state="readonly")
-combo_tipo.pack(side='left', padx=5)
-tb.Label(frame_filtros, text="Data:").pack(side='left', padx=5)
-entry_data = tb.Entry(frame_filtros, textvariable=filtro_data, width=12)
-entry_data.pack(side='left', padx=5)
-btn_buscar = tb.Button(frame_filtros, text="Buscar", bootstyle="primary", width=10)
-btn_buscar.pack(side='left', padx=10)
 
-# Área de gráficos
-frame_graficos = tb.LabelFrame(frame_dash, text="Gráficos", bootstyle="secondary", padding=10)
-frame_graficos.pack(fill='both', expand=True, padx=10, pady=10)
-
-# Criação do gráfico (sem dados iniciais)
-fig = Figure(figsize=(6, 3), dpi=100)
-ax = fig.add_subplot(111)
-canvas = FigureCanvasTkAgg(fig, master=frame_graficos)
-canvas.get_tk_widget().pack(fill='both', expand=True)
-frame_graficos.update_idletasks()
 
 # --- Funções principais ---
 def obter_dados():
+    if not root.winfo_exists():
+        return
     try:
         resposta = requests.get(BLYNK_URL_GET)
         if resposta.status_code == 200:
@@ -566,7 +625,9 @@ def obter_dados():
             print("Erro ao obter dados:", resposta.status_code)
     except Exception as e:
         print("Erro:", e)
-    root.after(5000, obter_dados)
+    # Só agenda próxima execução se a janela ainda existir
+    if root.winfo_exists():
+        root.after(5000, obter_dados)
 
 def atualizar_interface(dados):
     global popup_portao
@@ -574,6 +635,25 @@ def atualizar_interface(dados):
     umidade = dados.get('v5', '--')
     temperatura_var.set(f"\U0001F321 {temperatura} °C")
     umidade_var.set(f"\U0001F4A7 {umidade} %")
+
+    # Atualiza os gauges (se existirem) com os valores numéricos
+    try:
+        # temperatura pode vir como string '--' ou número
+        t = float(temperatura)
+        try:
+            temp_gauge.update(t)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        u = float(umidade)
+        try:
+            umid_gauge.update(u)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # Checa alarmes
     try:
@@ -635,40 +715,7 @@ def atualizar_interface(dados):
     except Exception:
         pass        
 
-    # --- Atualiza histórico e gráfico ---
-    try:
-        temp = float(temperatura)
-        umid = float(umidade)
-        hora = datetime.now().strftime('%H:%M:%S')
-        historico_horas.append(hora)
-        historico_temp.append(temp)
-        historico_umid.append(umid)
-    except:
-        pass
 
-    ax.clear()
-    ax.plot(list(historico_horas), list(historico_temp), label="Temperatura", color="orange")
-    ax.plot(list(historico_horas), list(historico_umid), label="Umidade", color="blue")
-    ax.set_title("Histórico Tempo Real")
-    ax.set_xlabel("Hora")
-    ax.set_ylabel("Valor")
-    ax.legend()
-    ax.tick_params(axis='x', rotation=45)
-
-    # Mostra no máximo 10 rótulos espaçados, sempre os últimos
-    horas = list(historico_horas)
-    n = len(horas)
-    max_labels = 10
-    if n > 1:
-        step = max(1, n // max_labels)
-        xticks = [horas[i] for i in range(0, n, step)]
-        # Garante que o último ponto sempre aparece como rótulo
-        if horas[-1] not in xticks:
-            xticks.append(horas[-1])
-        ax.set_xticks(xticks)
-    fig.tight_layout(rect=[0, 0.1, 1, 1])
-
-    canvas.draw()
 
 def acionar_rele_alarme(nome_rele):
     if nome_rele == "Nenhum":
@@ -895,11 +942,17 @@ def trigger_gesture_action(fingers_count):
     3 -> QUARTO (v7)
     4 -> CORREDOR (v8)
     """
+    global current_action_var
     try:
         # 'THUMB' é gesto de "joia/ polegar" para alternar o portão (v3)
         if fingers_count == 'THUMB':
             alternar_estado('v3')
             print("Gesto: POLEGAR -> alternando PORTAO (v3)")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Alternando PORTAO (v3)')
+            except Exception:
+                pass
             return
 
         # 5 dedos: ligar Mestre (v10) e os relés principais (v6,v7,v8,v9), exceto v3
@@ -914,6 +967,11 @@ def trigger_gesture_action(fingers_count):
             except Exception:
                 pass
             print("Gesto: 5 dedos -> Mestre ON (v10) e relés v6,v7,v8,v9 ligados")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Mestre ON: liga v6,v7,v8,v9')
+            except Exception:
+                pass
             return
 
         # 0 dedos: desligar Mestre e relés principais
@@ -928,58 +986,96 @@ def trigger_gesture_action(fingers_count):
             except Exception:
                 pass
             print("Gesto: 0 dedos -> Mestre OFF e relés v6,v7,v8,v9 desligados")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Mestre OFF: desliga v6,v7,v8,v9')
+            except Exception:
+                pass
             return
 
         # Mapear contagens para relés individuais conforme solicitado
         if fingers_count == 1:
-            alternar_estado('v6')  # 1 dedo -> QUARTO (v6)
-            print("Gesto: 1 dedo -> alterna QUARTO (v6)")
+            alternar_estado('v7')  # 1 dedo -> QUARTO (v7)
+            print("Gesto: 1 dedo -> alterna QUARTO (v7)")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Alterna QUARTO (v7)')
+            except Exception:
+                pass
             return
         if fingers_count == 2:
-            alternar_estado('v7')  # 2 dedos -> SALA (v7)
-            print("Gesto: 2 dedos -> alterna SALA (v7)")
+            alternar_estado('v6')  # 2 dedos -> SALA (v6)
+            print("Gesto: 2 dedos -> alterna SALA (v6)")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Alterna SALA (v6)')
+            except Exception:
+                pass
             return
         if fingers_count == 3:
             alternar_estado('v8')  # 3 dedos -> CORREDOR (v8)
             print("Gesto: 3 dedos -> alterna CORREDOR (v8)")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Alterna CORREDOR (v8)')
+            except Exception:
+                pass
             return
         if fingers_count == 4:
             alternar_estado('v9')  # 4 dedos -> GARAGEM (v9)
             print("Gesto: 4 dedos -> alterna GARAGEM (v9)")
+            try:
+                if current_action_var is not None:
+                    current_action_var.set('Alterna GARAGEM (v9)')
+            except Exception:
+                pass
             return
     except Exception as e:
         print("Erro ao acionar via gesto:", e)
 
 
 def _gesture_count_fingers(hand_landmarks, handedness):
-    """Conta dedos estendidos com base em landmarks do MediaPipe (heurística simples)."""
-    # índices dos dedos: dedo polegar é tratado separadamente
-    tips_ids = [4, 8, 12, 16, 20]
+    """Conta dedos estendidos com base em landmarks do MediaPipe."""
+    # Índices dos pontos das pontas dos dedos e suas bases
+    tips_ids = [4, 8, 12, 16, 20]  # pontas dos dedos
+    pips_ids = [2, 6, 10, 14, 18]  # articulações intermediárias
     count = 0
     lm = hand_landmarks.landmark
     extended = [False] * 5
-    # Polegar: heurística simples comparando x do tip com o ponto anterior
+
     try:
-        if lm[tips_ids[0]].x < lm[tips_ids[0]-1].x:
+        # Polegar: usar distância entre ponta do polegar e base do indicador
+        thumb_tip = lm[tips_ids[0]]
+        index_base = lm[5]  # base do indicador
+        
+        # Calcular distância entre polegar e base do indicador
+        thumb_dist = ((thumb_tip.x - index_base.x)**2 + (thumb_tip.y - index_base.y)**2)**0.5
+        
+        # Se o polegar está suficientemente longe da base do indicador, está estendido
+        if thumb_dist > 0.1:  # ajuste este valor conforme necessário
             extended[0] = True
             count += 1
-    except Exception:
-        pass
-    # outros dedos: comparar y do ponta com y do ponto abaixo
-    for idx, id in enumerate(tips_ids[1:], start=1):
-        try:
-            if lm[id].y < lm[id-2].y:
-                extended[idx] = True
-                count += 1
-        except Exception:
-            pass
 
-    # Se apenas o polegar estiver estendido -> interpretar como 'THUMB' (joia/polegar)
-    try:
+        # Outros dedos: comparar posição Y da ponta com a articulação
+        for i in range(1, 5):  # para os 4 dedos restantes
+            tip = lm[tips_ids[i]]
+            pip = lm[pips_ids[i]]
+            
+            # Um dedo está estendido se sua ponta está acima (Y menor) que sua articulação
+            if tip.y < pip.y - 0.05:  # margem para evitar falsos positivos
+                extended[i] = True
+                count += 1
+
+        # Caso especial: apenas polegar estendido = gesto "THUMB"
         if count == 1 and extended[0] and not any(extended[1:]):
             return 'THUMB'
-    except Exception:
-        pass
+
+        # Debug info
+        print(f"Dedos estendidos: {extended}, Contagem: {count}")
+        
+    except Exception as e:
+        print(f"Erro na detecção de dedos: {e}")
+        return 0
 
     return count
 
@@ -1099,9 +1195,209 @@ def _on_preview_externa_toggle(*args):
 
 # a câmera NÃO é inicializada automaticamente — inicia apenas quando
 # o usuário marcar 'Gestos Ativados'.
+
+# --- Aba Dashboards ---
+# Criar a aba de Dashboards antes do mainloop para que apareça na interface
+frame_dashboard = ttk.Frame(notebook)
+notebook.add(frame_dashboard, text="Dashboards")
+
+# Classe AngularGauge: encapsula um gauge matplotlib embutido em Tk
+class AngularGauge:
+    def __init__(self, parent, title, value=0, min_val=0, max_val=100, color='#4f81bd'):
+        import math
+        from matplotlib.patches import Wedge, Circle
+        
+        # Inicializar atributos
+        self.parent = parent
+        self.title = title
+        self.min_val = min_val
+        self.max_val = max_val
+        self.color = color
+
+        # Criar figura e eixos do Matplotlib com fundo transparente
+        self.fig, self.ax = plt.subplots(figsize=(3, 2.2))
+        self.fig.patch.set_facecolor('none')
+        self.ax.set_facecolor('none')
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.parent)
+
+        # desenhar elementos estáticos
+        self._draw_static()
+
+        # criar o arco de fundo (branco)
+        self.background_wedge = Wedge((0, 0), 1.0, 180, 0, facecolor='white', edgecolor='#cccccc', linewidth=1, zorder=1)
+        self.ax.add_patch(self.background_wedge)
+
+        # criar o arco de valor (inicialmente sem preenchimento)
+        self.val_wedge = Wedge((0, 0), 1.0, 180, 180, facecolor=self.color, edgecolor='none', zorder=2)
+        self.ax.add_patch(self.val_wedge)
+
+        # agulha (linha) e pivot
+        (self.needle_line,) = self.ax.plot([0, 0], [0, 0], color='#666666', linewidth=2, zorder=6)
+        self.pivot = Circle((0, 0), 0.04, facecolor='#666666', zorder=7)
+        self.ax.add_patch(self.pivot)
+
+        # texto do valor
+        self.value_text = self.ax.text(0, -0.18, '', ha='center', va='center', fontsize=12)
+
+        # configurar aspecto do plot
+        self.ax.set_aspect('equal')
+        self.ax.set_xlim(-1.05, 1.05)
+        self.ax.set_ylim(-0.25, 1.05)
+        self.ax.axis('off')
+
+        # set initial value
+        self.update(value)
+        
+    def _get_color_for_value(self, pct):
+        """Retorna cor baseada no valor percentual (0-1)"""
+        if self.color == '#c00000':  # Gauge de temperatura (vermelho)
+            # Gradiente de cinza para vermelho
+            r = min(1.0, 0.4 + 0.6 * pct)
+            g = max(0.4, 0.9 - 0.5 * pct)
+            b = max(0.4, 0.9 - 0.5 * pct)
+            return (r, g, b)
+        else:  # Gauge de umidade (verde)
+            # Gradiente de cinza para verde
+            r = max(0.4, 0.9 - 0.5 * pct)
+            g = min(1.0, 0.4 + 0.6 * pct)
+            b = max(0.4, 0.9 - 0.5 * pct)
+            return (r, g, b)
+
+        self.parent = parent
+        self.title = title
+        self.min_val = min_val
+        self.max_val = max_val
+
+        self.fig, self.ax = plt.subplots(figsize=(3, 2.2))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.parent)
+        self.canvas.get_tk_widget().pack(side='left', padx=8, pady=8)
+
+        # desenhar elementos estáticos
+        self._draw_static()
+
+        # criar o arco de valor com gradiente (inicialmente 180 deg)
+        self.val_wedge = Wedge((0, 0), 1.0, 180, 180, facecolor='#e6e6e6', edgecolor='none', zorder=2)
+        self.ax.add_patch(self.val_wedge)
+
+        # agulha (linha) e pivot
+        (self.needle_line,) = self.ax.plot([0, 0], [0, 0], color='#666666', linewidth=2, zorder=6)
+        self.pivot = Circle((0, 0), 0.04, facecolor='#666666', zorder=7)
+        self.ax.add_patch(self.pivot)
+
+        # texto do valor
+        self.value_text = self.ax.text(0, -0.18, '', ha='center', va='center', fontsize=12)
+
+        # set initial value
+        self.update(value)
+
+    def _draw_static(self):
+        import math
+        from matplotlib.patches import Wedge, Circle
+
+        ax = self.ax
+        ax.clear()
+        span = max(self.max_val - self.min_val, 1)
+
+        # center cover
+        center = Circle((0, 0), 0.08, facecolor='white', edgecolor='#cccccc', linewidth=1, zorder=5)
+        ax.add_patch(center)
+
+        # ticks mais sutis
+        steps = 10  # mais divisões para melhor granularidade
+        for i in range(steps + 1):
+            ang_deg = 180 - (180.0 / steps) * i
+            ang = math.radians(ang_deg)
+            x_out, y_out = math.cos(ang), math.sin(ang)
+            x_in, y_in = 0.90 * x_out, 0.90 * y_out
+            # Ticks menores e mais sutis
+            ax.plot([x_in, x_out], [y_in, y_out], color='#cccccc', linewidth=0.5)
+            
+            # Mostrar números apenas nos pontos principais
+            if i % 2 == 0:  # apenas nos pontos pares
+                lbl_val = (span / steps) * i
+                lx, ly = 0.75 * x_out, 0.75 * y_out
+                ax.text(lx, ly - 0.02, f'{int(lbl_val)}', ha='center', va='center', fontsize=8, color='#666666')
+
+        # título
+        ax.text(0, 1.08, self.title, ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        ax.set_aspect('equal')
+        ax.set_xlim(-1.05, 1.05)
+        ax.set_ylim(-0.25, 1.05)
+        ax.axis('off')
+
+    def update(self, value):
+        import math
+
+        span = max(self.max_val - self.min_val, 1)
+        clipped = max(self.min_val, min(self.max_val, value))
+        pct = (clipped - self.min_val) / span
+
+        # Determinar a cor do preenchimento
+        if self.color == '#c00000':  # Temperatura
+            fill_color = '#ff0000'  # Vermelho puro
+        else:  # Umidade
+            fill_color = '#00ff00'  # Verde puro
+
+        # atualizar arco do valor
+        theta1 = 180  # Começa da esquerda
+        theta2 = 180 - (180.0 * pct)  # Move em direção à direita conforme valor aumenta
+        
+        # Configurar o arco de valor com a cor apropriada
+        self.val_wedge.set_facecolor(fill_color)
+        self.val_wedge.set_theta1(180)  # Sempre começa da esquerda
+        self.val_wedge.set_theta2(theta2)  # Preenche até o valor atual
+        
+        # Manter agulha e pivot em cinza
+        self.needle_line.set_color('#666666')
+        self.pivot.set_facecolor('#666666')
+        
+        try:
+            self.val_wedge.set_theta1(theta1)
+            self.val_wedge.set_theta2(theta2)
+        except Exception:
+            self.val_wedge.theta1 = theta1
+            self.val_wedge.theta2 = theta2
+
+        # atualizar agulha
+        ang_val = math.radians(theta2)
+        nx, ny = 0.9 * math.cos(ang_val), 0.9 * math.sin(ang_val)
+        self.needle_line.set_data([0, nx], [0, ny])
+
+        # atualizar texto do valor
+        unit = '%' if (self.max_val - self.min_val) <= 100 else ''
+        self.value_text.set_text(f'{int(clipped)} {unit}')
+
+        # desenhar/atualizar canvas
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            self.canvas.draw()
+
+
+# Frame para centralizar os gauges
+gauge_frame = tb.Frame(frame_dashboard)
+gauge_frame.pack(expand=True, fill='both', padx=20, pady=20)
+
+# Frame interno para alinhar os gauges horizontalmente no centro
+gauge_container = tb.Frame(gauge_frame)
+gauge_container.pack(expand=True)
+
+# Instanciar gauges para Temperatura e Umidade (valores iniciais)
+temp_gauge = AngularGauge(gauge_container, 'Temperatura', 0, 0, 100, color='#c00000')  # Vermelho
+temp_gauge.canvas.get_tk_widget().pack(side='left', padx=20)
+
+umid_gauge = AngularGauge(gauge_container, 'Umidade', 0, 0, 100, color='#00c000')  # Verde
+umid_gauge.canvas.get_tk_widget().pack(side='left', padx=20)
+
 obter_dados()
 # garantir parada de threads ao fechar
 def _on_close():
+    try:
+        # Cancela todos os callbacks pendentes
+        root.after_cancel('all')
+    except Exception:
+        pass
     try:
         stop_gesture_thread()
     except Exception:
@@ -1110,6 +1406,18 @@ def _on_close():
         stop_alarm_sound()
     except Exception:
         pass
+    try:
+        # Limpa referências dos gauges
+        global temp_gauge, umid_gauge
+        if temp_gauge:
+            temp_gauge.canvas.get_tk_widget().destroy()
+            temp_gauge = None
+        if umid_gauge:
+            umid_gauge.canvas.get_tk_widget().destroy()
+            umid_gauge = None
+    except Exception:
+        pass
+    root.quit()
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
