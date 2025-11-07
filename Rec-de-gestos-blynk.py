@@ -9,8 +9,7 @@ from collections import deque
 import threading
 import os
 import platform
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+# Matplotlib removido — usamos ttkbootstrap.Meter (TTBGauge) em vez de AngularGauge
 
 # --- Reconhecimento de gestos (opcional: OpenCV + MediaPipe) ---
 try:
@@ -129,8 +128,7 @@ gestos_label_text = tk.StringVar(value=("Gestos: disponível" if GESTURE_AVAILAB
 tb.Checkbutton(frame_tema, text="Gestos Ativados", variable=gestos_ativos, bootstyle="info", width=14).pack(side='left', padx=10)
 tb.Label(frame_tema, textvariable=gestos_label_text, font=("Segoe UI", 9)).pack(side='left', padx=6)
 # Checkbutton separado para abrir/fechar preview externo (janela separada)
-preview_externa_ativa = tk.BooleanVar(value=False)
-tb.Checkbutton(frame_tema, text="Preview Externo", variable=preview_externa_ativa, bootstyle="secondary", width=14).pack(side='left', padx=10)
+# Checkbutton separado para abrir/fechar preview externo (removido)
 # Checkbutton para desenhar landmarks (variável definida aqui)
 preview_draw_landmarks = tk.BooleanVar(value=True)
 tb.Checkbutton(frame_tema, text="Desenhar landmarks", variable=preview_draw_landmarks, bootstyle="info", width=18).pack(side='left', padx=6)
@@ -627,7 +625,8 @@ def obter_dados():
         print("Erro:", e)
     # Só agenda próxima execução se a janela ainda existir
     if root.winfo_exists():
-        root.after(5000, obter_dados)
+        # atualizar a cada 3 segundos para tempo quase real
+        root.after(3000, obter_dados)
 
 def atualizar_interface(dados):
     global popup_portao
@@ -638,20 +637,65 @@ def atualizar_interface(dados):
 
     # Atualiza os gauges (se existirem) com os valores numéricos
     try:
+        # variáveis locais para passar aos picos por hora
+        parsed_temp_val = None
+        parsed_umid_val = None
+    except Exception:
+        parsed_temp_val = None
+        parsed_umid_val = None
+    try:
         # temperatura pode vir como string '--' ou número
         t = float(temperatura)
+        # clamp para 0-100
+        tc = max(0.0, min(100.0, t))
+        # atualiza histórico para o gráfico
         try:
-            temp_gauge.update(t)
+            temp_history.append(tc)
+        except Exception:
+            pass
+        parsed_temp_val = tc
+        try:
+            temp_gauge.update(tc)
+        except Exception:
+            pass
+        # atualiza label numérico abaixo do gauge
+        try:
+            if temp_value_var is not None:
+                temp_value_var.set(f"{tc:.1f} °C")
         except Exception:
             pass
     except Exception:
         pass
     try:
         u = float(umidade)
+        uc = max(0.0, min(100.0, u))
+        # atualiza histórico para o gráfico
         try:
-            umid_gauge.update(u)
+            umid_history.append(uc)
         except Exception:
             pass
+        parsed_umid_val = uc
+        try:
+            umid_gauge.update(uc)
+        except Exception:
+            pass
+        # atualiza label numérico abaixo do gauge
+        try:
+            if umid_value_var is not None:
+                umid_value_var.set(f"{uc:.1f} %")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # redesenha os gráficos em linha (tenta não falhar se canvas ainda não estiver pronto)
+    try:
+        # atualiza picos por hora antes de redesenhar (usa valores já parseados quando disponíveis)
+        try:
+            _update_hourly_peaks(parsed_temp_val, parsed_umid_val, datetime.now())
+        except Exception:
+            pass
+        _draw_charts()
     except Exception:
         pass
 
@@ -1180,18 +1224,7 @@ def _on_gestos_toggle(*args):
 
 gestos_ativos.trace_add('write', lambda *a: _on_gestos_toggle())
 
-# handler para preview externo (checkbox separado)
-def _on_preview_externa_toggle(*args):
-    if preview_externa_ativa.get():
-        try:
-            open_preview_window()
-        except Exception:
-            pass
-    else:
-        try:
-            close_preview_window()
-        except Exception:
-            pass
+
 
 # a câmera NÃO é inicializada automaticamente — inicia apenas quando
 # o usuário marcar 'Gestos Ativados'.
@@ -1201,194 +1234,505 @@ def _on_preview_externa_toggle(*args):
 frame_dashboard = ttk.Frame(notebook)
 notebook.add(frame_dashboard, text="Dashboards")
 
-# Classe AngularGauge: encapsula um gauge matplotlib embutido em Tk
-class AngularGauge:
-    def __init__(self, parent, title, value=0, min_val=0, max_val=100, color='#4f81bd'):
-        import math
-        from matplotlib.patches import Wedge, Circle
-        
-        # Inicializar atributos
-        self.parent = parent
-        self.title = title
-        self.min_val = min_val
-        self.max_val = max_val
-        self.color = color
-
-        # Criar figura e eixos do Matplotlib com fundo transparente
-        self.fig, self.ax = plt.subplots(figsize=(3, 2.2))
-        self.fig.patch.set_facecolor('none')
-        self.ax.set_facecolor('none')
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.parent)
-
-        # desenhar elementos estáticos
-        self._draw_static()
-
-        # criar o arco de fundo (branco)
-        self.background_wedge = Wedge((0, 0), 1.0, 180, 0, facecolor='white', edgecolor='#cccccc', linewidth=1, zorder=1)
-        self.ax.add_patch(self.background_wedge)
-
-        # criar o arco de valor (inicialmente sem preenchimento)
-        self.val_wedge = Wedge((0, 0), 1.0, 180, 180, facecolor=self.color, edgecolor='none', zorder=2)
-        self.ax.add_patch(self.val_wedge)
-
-        # agulha (linha) e pivot
-        (self.needle_line,) = self.ax.plot([0, 0], [0, 0], color='#666666', linewidth=2, zorder=6)
-        self.pivot = Circle((0, 0), 0.04, facecolor='#666666', zorder=7)
-        self.ax.add_patch(self.pivot)
-
-        # texto do valor
-        self.value_text = self.ax.text(0, -0.18, '', ha='center', va='center', fontsize=12)
-
-        # configurar aspecto do plot
-        self.ax.set_aspect('equal')
-        self.ax.set_xlim(-1.05, 1.05)
-        self.ax.set_ylim(-0.25, 1.05)
-        self.ax.axis('off')
-
-        # set initial value
-        self.update(value)
-        
-    def _get_color_for_value(self, pct):
-        """Retorna cor baseada no valor percentual (0-1)"""
-        if self.color == '#c00000':  # Gauge de temperatura (vermelho)
-            # Gradiente de cinza para vermelho
-            r = min(1.0, 0.4 + 0.6 * pct)
-            g = max(0.4, 0.9 - 0.5 * pct)
-            b = max(0.4, 0.9 - 0.5 * pct)
-            return (r, g, b)
-        else:  # Gauge de umidade (verde)
-            # Gradiente de cinza para verde
-            r = max(0.4, 0.9 - 0.5 * pct)
-            g = min(1.0, 0.4 + 0.6 * pct)
-            b = max(0.4, 0.9 - 0.5 * pct)
-            return (r, g, b)
-
-        self.parent = parent
-        self.title = title
-        self.min_val = min_val
-        self.max_val = max_val
-
-        self.fig, self.ax = plt.subplots(figsize=(3, 2.2))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.parent)
-        self.canvas.get_tk_widget().pack(side='left', padx=8, pady=8)
-
-        # desenhar elementos estáticos
-        self._draw_static()
-
-        # criar o arco de valor com gradiente (inicialmente 180 deg)
-        self.val_wedge = Wedge((0, 0), 1.0, 180, 180, facecolor='#e6e6e6', edgecolor='none', zorder=2)
-        self.ax.add_patch(self.val_wedge)
-
-        # agulha (linha) e pivot
-        (self.needle_line,) = self.ax.plot([0, 0], [0, 0], color='#666666', linewidth=2, zorder=6)
-        self.pivot = Circle((0, 0), 0.04, facecolor='#666666', zorder=7)
-        self.ax.add_patch(self.pivot)
-
-        # texto do valor
-        self.value_text = self.ax.text(0, -0.18, '', ha='center', va='center', fontsize=12)
-
-        # set initial value
-        self.update(value)
-
-    def _draw_static(self):
-        import math
-        from matplotlib.patches import Wedge, Circle
-
-        ax = self.ax
-        ax.clear()
-        span = max(self.max_val - self.min_val, 1)
-
-        # center cover
-        center = Circle((0, 0), 0.08, facecolor='white', edgecolor='#cccccc', linewidth=1, zorder=5)
-        ax.add_patch(center)
-
-        # ticks mais sutis
-        steps = 10  # mais divisões para melhor granularidade
-        for i in range(steps + 1):
-            ang_deg = 180 - (180.0 / steps) * i
-            ang = math.radians(ang_deg)
-            x_out, y_out = math.cos(ang), math.sin(ang)
-            x_in, y_in = 0.90 * x_out, 0.90 * y_out
-            # Ticks menores e mais sutis
-            ax.plot([x_in, x_out], [y_in, y_out], color='#cccccc', linewidth=0.5)
-            
-            # Mostrar números apenas nos pontos principais
-            if i % 2 == 0:  # apenas nos pontos pares
-                lbl_val = (span / steps) * i
-                lx, ly = 0.75 * x_out, 0.75 * y_out
-                ax.text(lx, ly - 0.02, f'{int(lbl_val)}', ha='center', va='center', fontsize=8, color='#666666')
-
-        # título
-        ax.text(0, 1.08, self.title, ha='center', va='bottom', fontsize=10, fontweight='bold')
-
-        ax.set_aspect('equal')
-        ax.set_xlim(-1.05, 1.05)
-        ax.set_ylim(-0.25, 1.05)
-        ax.axis('off')
-
-    def update(self, value):
-        import math
-
-        span = max(self.max_val - self.min_val, 1)
-        clipped = max(self.min_val, min(self.max_val, value))
-        pct = (clipped - self.min_val) / span
-
-        # Determinar a cor do preenchimento
-        if self.color == '#c00000':  # Temperatura
-            fill_color = '#ff0000'  # Vermelho puro
-        else:  # Umidade
-            fill_color = '#00ff00'  # Verde puro
-
-        # atualizar arco do valor
-        theta1 = 180  # Começa da esquerda
-        theta2 = 180 - (180.0 * pct)  # Move em direção à direita conforme valor aumenta
-        
-        # Configurar o arco de valor com a cor apropriada
-        self.val_wedge.set_facecolor(fill_color)
-        self.val_wedge.set_theta1(180)  # Sempre começa da esquerda
-        self.val_wedge.set_theta2(theta2)  # Preenche até o valor atual
-        
-        # Manter agulha e pivot em cinza
-        self.needle_line.set_color('#666666')
-        self.pivot.set_facecolor('#666666')
-        
-        try:
-            self.val_wedge.set_theta1(theta1)
-            self.val_wedge.set_theta2(theta2)
-        except Exception:
-            self.val_wedge.theta1 = theta1
-            self.val_wedge.theta2 = theta2
-
-        # atualizar agulha
-        ang_val = math.radians(theta2)
-        nx, ny = 0.9 * math.cos(ang_val), 0.9 * math.sin(ang_val)
-        self.needle_line.set_data([0, nx], [0, ny])
-
-        # atualizar texto do valor
-        unit = '%' if (self.max_val - self.min_val) <= 100 else ''
-        self.value_text.set_text(f'{int(clipped)} {unit}')
-
-        # desenhar/atualizar canvas
-        try:
-            self.canvas.draw_idle()
-        except Exception:
-            self.canvas.draw()
+# AngularGauge (Matplotlib) removido — usamos TTBGauge (ttkbootstrap.Meter) agora.
 
 
 # Frame para centralizar os gauges
 gauge_frame = tb.Frame(frame_dashboard)
 gauge_frame.pack(expand=True, fill='both', padx=20, pady=20)
 
+# Linha acima dos gauges: mostra temperatura e umidade com ícones (sem setpoint/reles)
+top_values_row = tb.Frame(gauge_frame)
+top_values_row.pack(fill='x', pady=(0,12))
+
+# Temperatura (à esquerda) — usar LabelFrame parecido com a aba Home, sem setpoint/relés
+temp_dashboard_frame = tb.LabelFrame(top_values_row, text="Temperatura", bootstyle="secondary", padding=6)
+temp_dashboard_frame.pack(side='left', expand=True, fill='x', padx=(0,8))
+tb.Label(temp_dashboard_frame, textvariable=temperatura_var, font=("Segoe UI", 14, 'bold'), bootstyle="warning").pack(anchor='w')
+
+# Umidade (à direita) — LabelFrame como na Home
+umid_dashboard_frame = tb.LabelFrame(top_values_row, text="Umidade", bootstyle="secondary", padding=6)
+umid_dashboard_frame.pack(side='right', expand=True, fill='x', padx=(8,0))
+tb.Label(umid_dashboard_frame, textvariable=umidade_var, font=("Segoe UI", 14, 'bold'), bootstyle="info").pack(anchor='e')
+
 # Frame interno para alinhar os gauges horizontalmente no centro
 gauge_container = tb.Frame(gauge_frame)
 gauge_container.pack(expand=True)
+# (Classe TTBGauge definida abaixo para ser usada pelas instâncias)
 
-# Instanciar gauges para Temperatura e Umidade (valores iniciais)
-temp_gauge = AngularGauge(gauge_container, 'Temperatura', 0, 0, 100, color='#c00000')  # Vermelho
-temp_gauge.canvas.get_tk_widget().pack(side='left', padx=20)
+# Alternativa: gauge usando ttkbootstrap.Meter para um visual nativo e leve.
+class TTBGauge:
+    """Adapter simples que usa tb.Meter e expõe a API usada pelo código existente:
+    - .update(value)
+    - .canvas.get_tk_widget() -> widget (para pack)
+    """
+    class _CanvasWrapper:
+        def __init__(self, widget):
+            self._w = widget
+        def get_tk_widget(self):
+            return self._w
 
-umid_gauge = AngularGauge(gauge_container, 'Umidade', 0, 0, 100, color='#00c000')  # Verde
-umid_gauge.canvas.get_tk_widget().pack(side='left', padx=20)
+    def __init__(self, parent, title, value=0, min_val=0, max_val=100, color='#4f81bd'):
+        self.parent = parent
+        self.title = title
+        self.min_val = min_val
+        self.max_val = max_val
+
+        # frame que contém o Meter
+        self._frame = tb.Frame(self.parent)
+
+        # escolher bootstyle aproximado pelo parâmetro de cor
+        bootstyle = 'success' if color and (color.startswith('#00') or 'green' in color.lower()) else 'danger'
+
+        # criar o Meter — amount será percentual (0-100)
+        try:
+            self.meter = tb.Meter(self._frame, metersize=160, amount=0, subtext=title, bootstyle=bootstyle)
+            # empacotar o meter dentro do frame
+            try:
+                self.meter.pack(expand=True)
+            except Exception:
+                pass
+        except Exception:
+            # fallback para versões de ttkbootstrap que não tenham Meter
+            self.meter = tb.Label(self._frame, text=title)
+
+        # wrapper compatível com API antiga
+        self.canvas = TTBGauge._CanvasWrapper(self._frame)
+
+        # set initial value
+        self.update(value)
+
+    def update(self, value):
+        # normalize to 0-100
+        try:
+            span = max(self.max_val - self.min_val, 1)
+            pct = int((max(self.min_val, min(self.max_val, value)) - self.min_val) / span * 100)
+        except Exception:
+            pct = 0
+        try:
+            # Meter espera amount em 0-100
+            if hasattr(self.meter, 'configure'):
+                self.meter.configure(amount=pct)
+            else:
+                # se meter for apenas um Label (fallback), atualizar texto
+                self.meter.config(text=f"{self.title}\n{int(value)}")
+        except Exception:
+            pass
+
+# Instanciar gauges tipo velocímetro (SpeedometerGauge)
+class SpeedometerGauge:
+    """Gauge tipo velocímetro desenhado em tk.Canvas.
+    Exibe arco, marcas, ponteiro (needle) e valor numérico.
+    API mínima: .update(value) e .canvas.get_tk_widget() compatível com código existente.
+    """
+    class _CanvasWrapper:
+        def __init__(self, widget):
+            self._w = widget
+        def get_tk_widget(self):
+            return self._w
+
+    def __init__(self, parent, title, value=0, min_val=0, max_val=100, color='#4f81bd', size=220, unit='', invert=False):
+        self.parent = parent
+        self.title = title
+        # garante floats para evitar formatação/escala errada quando valores vierem como strings
+        try:
+            self.min_val = float(min_val)
+        except Exception:
+            self.min_val = 0.0
+        try:
+            self.max_val = float(max_val)
+        except Exception:
+            self.max_val = 100.0
+        self.color = color
+        self.unit = unit
+        self.size = size
+        # permite inverter a orientação do ponteiro por instância
+        self.invert = bool(invert)
+
+        # frame que contém o canvas
+        self._frame = tb.Frame(self.parent)
+
+        # canvas com altura menor que largura para acomodar semicirculo
+        # aumentar um pouco a altura para evitar corte das labels externas
+        h = int(self.size * 0.7)
+        # determina background compatível com ttk/ttkbootstrap frames
+        try:
+            bg = self._frame.cget('background')
+        except Exception:
+            try:
+                bg = root.cget('background')
+            except Exception:
+                bg = 'white'
+        # aumentar a largura do canvas para evitar corte de rótulos à direita
+        canvas_w = int(self.size * 1.8)
+        self._canvas = tk.Canvas(self._frame, width=canvas_w, height=h, bg=bg, highlightthickness=0)
+        self._canvas.pack()
+
+        # parâmetros geométricos
+        self.cx = canvas_w // 2
+        self.cy = int(h * 0.9)
+        self.radius = int(min(self.cx, self.cy) * 0.9)
+
+        # desenho estático: arco e marcas
+        self._draw_background()
+
+        # ponteiro (needle) e texto de valor
+        self.needle = self._canvas.create_line(self.cx, self.cy, self.cx, self.cy - self.radius + 10, fill='black', width=3)
+        self.value_text = self._canvas.create_text(self.cx, int(h*0.40), text=str(int(value)) + (self.unit or ''), font=('Segoe UI', 12, 'bold'))
+        self.title_text = self._canvas.create_text(self.cx, int(h*0.72), text=self.title, font=('Segoe UI', 9))
+
+        # wrapper compatível com API antiga
+        self.canvas = SpeedometerGauge._CanvasWrapper(self._frame)
+
+        # set initial
+        self.update(value)
+
+    def _angle_for_value(self, value):
+        # mapeia value em [min_val,max_val] para ângulo em graus: -135 -> +135 (270°)
+        try:
+            v = max(self.min_val, min(self.max_val, value))
+            frac = (v - self.min_val) / max(self.max_val - self.min_val, 1)
+            # O desenho do fundo usa ângulos de -270 a 0 (ver _draw_background).
+            # Por padrão mapeamos frac -> -270..0 (valores baixos à esquerda, altos à direita).
+            # Se self.invert for True, invertemos a orientação (frac -> 0..-270).
+            if getattr(self, 'invert', False):
+                angle = -frac * 270
+            else:
+                angle = -270 + frac * 270
+            return angle
+        except Exception:
+            return -360
+
+    def _polar(self, angle_deg, r):
+        import math
+        angle_rad = math.radians(angle_deg)
+        x = self.cx + r * math.cos(angle_rad)
+        y = self.cy + r * math.sin(angle_rad)
+        return x, y
+
+    def _draw_background(self):
+        # arco principal
+        start = -270
+        extent = 270
+        # bbox do arco
+        x0 = self.cx - self.radius
+        y0 = self.cy - self.radius
+        x1 = self.cx + self.radius
+        y1 = self.cy + self.radius
+        try:
+            # arco de fundo
+            self._canvas.create_arc(x0, y0, x1, y1, start=start, extent=extent, style='arc', width=12, outline=self.color)
+        except Exception:
+            pass
+
+        # marcas (ticks) e rótulos
+        steps = 20
+        label_set = {0, 25, 50, 75, 100}
+        for i in range(steps + 1):
+            frac = i / steps
+            # use o mesmo mapeamento por-instância (considera self.invert)
+            try:
+                # val corresponde ao valor representado por este tick
+                val = self.min_val + frac * (self.max_val - self.min_val)
+                angle = self._angle_for_value(val)
+            except Exception:
+                angle = -270 + frac * 270
+            outer = self._polar(angle, self.radius)
+            inner = self._polar(angle, self.radius - 14)
+            self._canvas.create_line(outer[0], outer[1], inner[0], inner[1], fill='#333', width=2)
+            # desenhar apenas labels principais (0,25,50,75,100) posicionado mais para dentro
+            val = int(round(self.min_val + frac * (self.max_val - self.min_val)))
+            if val in label_set:
+                label_pos = self._polar(angle, self.radius - 60)
+                self._canvas.create_text(label_pos[0], label_pos[1], text=str(val), font=('Segoe UI', 9))
+
+    def update(self, value):
+        try:
+            # clamps
+            v = value
+            if v is None:
+                v = self.min_val
+            v = max(self.min_val, min(self.max_val, float(v)))
+        except Exception:
+            v = self.min_val
+        # calcular posição do needle
+        angle = self._angle_for_value(v)
+        x, y = self._polar(angle, self.radius - 18)
+        try:
+            self._canvas.coords(self.needle, self.cx, self.cy, x, y)
+            txt = f"{int(v)}{self.unit}"
+            self._canvas.itemconfigure(self.value_text, text=txt)
+        except Exception:
+            pass
+
+# Instanciar gauges tipo velocímetro para Temperatura e Umidade
+# Colocar cada gauge dentro do seu LabelFrame respectivo (Dashboard)
+# Assim os gauges ficam próximos aos valores/controles correspondentes
+temp_gauge = SpeedometerGauge(temp_dashboard_frame, 'Temperatura', 0, 0, 100, color='#c00000', size=220, unit=' °C', invert=True)
+temp_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
+
+umid_gauge = SpeedometerGauge(umid_dashboard_frame, 'Umidade', 0, 0, 100, color='#00c000', size=220, unit=' %', invert=False)
+umid_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
+
+# Labels de valor em tempo real (numérico) abaixo de cada gauge (opcional, duplicado com o texto interno)
+try:
+    temp_value_var = tk.StringVar(value='-- °C')
+    umid_value_var = tk.StringVar(value='-- %')
+except Exception:
+    temp_value_var = None
+    umid_value_var = None
+
+# Colocar os labels dentro dos frames dos gauges para alinhamento
+try:
+    if temp_value_var is not None:
+        tb.Label(temp_gauge.canvas.get_tk_widget(), textvariable=temp_value_var,
+                 font=("Segoe UI", 12, 'bold'), bootstyle='warning').pack(pady=(6,0))
+    if umid_value_var is not None:
+        tb.Label(umid_gauge.canvas.get_tk_widget(), textvariable=umid_value_var,
+                 font=("Segoe UI", 12, 'bold'), bootstyle='info').pack(pady=(6,0))
+except Exception:
+    pass
+
+# --- Mini-gráfico combinado (histórico) abaixo dos gauges ---
+# Históricos em memória (últimos N pontos)
+from collections import deque as _deque
+HISTORY_MAX = 240
+temp_history = _deque(maxlen=HISTORY_MAX)
+umid_history = _deque(maxlen=HISTORY_MAX)
+
+# Histórico de picos por hora (últimas N horas)
+HOUR_PEAKS_MAX = 72  # guarda ~3 dias se desejar
+hour_peaks_temp = _deque(maxlen=HOUR_PEAKS_MAX)
+hour_peaks_umid = _deque(maxlen=HOUR_PEAKS_MAX)
+hour_peaks_times = _deque(maxlen=HOUR_PEAKS_MAX)
+# estado do bucket da hora corrente (não preenchido na inicialização)
+_current_hour_ts = None
+_current_hour_temp_peak = None
+_current_hour_umid_peak = None
+
+def _update_hourly_peaks(t_val, u_val, ts=None):
+    """Atualiza o bucket do pico por hora.
+    - t_val, u_val: valores atuais (0..100) ou None
+    - ts: datetime do sample (se None usa now())
+    Lógica:
+    - mantém um bucket para a hora atual (ex.: 2025-11-07 14:00:00)
+    - dentro da hora atual atualiza o máximo observado
+    - ao entrar em uma nova hora, empurra o pico da hora anterior para a fila
+    """
+    global _current_hour_ts, _current_hour_temp_peak, _current_hour_umid_peak
+    try:
+        if ts is None:
+            ts = datetime.now()
+        hour_ts = ts.replace(minute=0, second=0, microsecond=0)
+
+        # primeira amostra
+        if _current_hour_ts is None:
+            _current_hour_ts = hour_ts
+            _current_hour_temp_peak = float(t_val) if t_val is not None else None
+            _current_hour_umid_peak = float(u_val) if u_val is not None else None
+            return
+
+        # mesma hora: atualizar máximos
+        if hour_ts == _current_hour_ts:
+            if t_val is not None:
+                try:
+                    if _current_hour_temp_peak is None:
+                        _current_hour_temp_peak = float(t_val)
+                    else:
+                        _current_hour_temp_peak = max(_current_hour_temp_peak, float(t_val))
+                except Exception:
+                    _current_hour_temp_peak = float(t_val)
+            if u_val is not None:
+                try:
+                    if _current_hour_umid_peak is None:
+                        _current_hour_umid_peak = float(u_val)
+                    else:
+                        _current_hour_umid_peak = max(_current_hour_umid_peak, float(u_val))
+                except Exception:
+                    _current_hour_umid_peak = float(u_val)
+            return
+
+        # hora avançou: empurra o bucket anterior para as filas (pode haver saltos de várias horas)
+        try:
+            hour_peaks_temp.append(_current_hour_temp_peak if _current_hour_temp_peak is not None else 0.0)
+            hour_peaks_umid.append(_current_hour_umid_peak if _current_hour_umid_peak is not None else 0.0)
+            hour_peaks_times.append(_current_hour_ts)
+        except Exception:
+            pass
+
+        # iniciar novo bucket com a amostra atual
+        _current_hour_ts = hour_ts
+        _current_hour_temp_peak = float(t_val) if t_val is not None else None
+        _current_hour_umid_peak = float(u_val) if u_val is not None else None
+    except Exception:
+        # não deixar falhas quebrarem a UI
+        return
+
+# Frame que contém o gráfico combinado (posicionado abaixo dos gauges)
+charts_frame = tb.Frame(gauge_frame)
+charts_frame.pack(fill='both', pady=(12,0), expand=True)
+
+# Canvas único para ambos (temperatura e umidade)
+COMBINED_CHART_W = 1040
+COMBINED_CHART_H = 160
+combined_chart_canvas = tk.Canvas(charts_frame, width=COMBINED_CHART_W, height=COMBINED_CHART_H, bg='#ffffff', highlightthickness=1, highlightbackground='#cccccc')
+combined_chart_canvas.pack(fill='both', expand=True)
+
+def _draw_combined_chart(canvas, temp_data, umid_data):
+    """Desenha um gráfico combinado (duas linhas) no mesmo canvas.
+    temp_data e umid_data são sequências de 0..100.
+    """
+    try:
+        canvas.delete('all')
+        w = int(canvas.winfo_width() or COMBINED_CHART_W)
+        h = int(canvas.winfo_height() or COMBINED_CHART_H)
+
+        # fundo
+        canvas.create_rectangle(0, 0, w, h, fill=canvas['bg'], outline='')
+
+        # título e última leitura (à direita)
+        last_t = f"T: {temp_data[-1]:.1f}°C" if temp_data else "T: --"
+        last_u = f"H: {umid_data[-1]:.1f}%" if umid_data else "H: --"
+        canvas.create_text(8, 6, text='Histórico (Temperatura / Umidade)', anchor='nw', font=('Segoe UI', 9, 'bold'))
+        canvas.create_text(w - 8, 6, text=f"{last_t}   {last_u}", anchor='ne', font=('Segoe UI', 9))
+
+        # Margens
+        left = 36
+        right = 12
+        top = 26
+        bottom = 18
+        plot_w = max(10, w - left - right)
+        plot_h = max(10, h - top - bottom)
+
+        # desenhar linhas Y (0,25,50,75,100)
+        for v in (0, 25, 50, 75, 100):
+            y = top + (100 - v) / 100.0 * plot_h
+            canvas.create_line(left, y, w - right, y, fill='#f0f0f0')
+            canvas.create_text(6, y, text=str(v), anchor='w', font=('Segoe UI', 7), fill='#666')
+
+        def _map_points(data):
+            n = len(data)
+            pts = []
+            if n == 0:
+                return pts
+            for i, val in enumerate(data):
+                x = left + (i / max(1, n-1)) * plot_w if n > 1 else left + plot_w/2
+                y = top + (100 - max(0, min(100, float(val)))) / 100.0 * plot_h
+                pts.append((x, y))
+            return pts
+
+        t_pts = _map_points(temp_data)
+        u_pts = _map_points(umid_data)
+
+        # desenhar linhas com suavização
+        if t_pts:
+            t_flat = [coord for p in t_pts for coord in p]
+            canvas.create_line(*t_flat, fill='#c00000', width=2, smooth=True)
+        if u_pts:
+            u_flat = [coord for p in u_pts for coord in p]
+            canvas.create_line(*u_flat, fill='#007f00', width=2, smooth=True)
+
+        # desenhar picos por hora (mapeamento temporal real no eixo X)
+        try:
+            # montar listas incluindo o bucket corrente (não finalizado)
+            times = list(hour_peaks_times)
+            temps = list(hour_peaks_temp)
+            ums = list(hour_peaks_umid)
+            try:
+                if _current_hour_ts is not None:
+                    # evitar duplicar se o último já for a hora corrente
+                    if not times or times[-1] != _current_hour_ts:
+                        times.append(_current_hour_ts)
+                        temps.append(_current_hour_temp_peak if _current_hour_temp_peak is not None else 0.0)
+                        ums.append(_current_hour_umid_peak if _current_hour_umid_peak is not None else 0.0)
+            except Exception:
+                pass
+
+            if times:
+                # converter para timestamps (float)
+                ts_vals = []
+                for t in times:
+                    try:
+                        ts_vals.append(float(t.timestamp()))
+                    except Exception:
+                        ts_vals.append(float(datetime.timestamp(t)))
+
+                min_ts = min(ts_vals)
+                max_ts = max(ts_vals)
+                span = max_ts - min_ts if max_ts > min_ts else 1.0
+
+                # mapear ponto temporal para X
+                def time_to_x(tsf):
+                    return left + ((tsf - min_ts) / span) * plot_w
+
+                # criar pontos para temperatura/umidade
+                hp_t_pts = []
+                hp_u_pts = []
+                for tsf, val_t, val_u in zip(ts_vals, temps, ums):
+                    x = time_to_x(tsf)
+                    y_t = top + (100 - max(0, min(100, float(val_t)))) / 100.0 * plot_h
+                    y_u = top + (100 - max(0, min(100, float(val_u)))) / 100.0 * plot_h
+                    hp_t_pts.append((x, y_t))
+                    hp_u_pts.append((x, y_u))
+
+                # desenhar linhas e marcadores temporais
+                if hp_t_pts:
+                    canvas.create_line(*[c for p in hp_t_pts for c in p], fill='#800000', width=1, dash=(4,2), smooth=True)
+                    for x, y in hp_t_pts:
+                        canvas.create_oval(x-3, y-3, x+3, y+3, fill='#800000', outline='')
+                if hp_u_pts:
+                    canvas.create_line(*[c for p in hp_u_pts for c in p], fill='#006400', width=1, dash=(2,4), smooth=True)
+                    for x, y in hp_u_pts:
+                        canvas.create_rectangle(x-3, y-3, x+3, y+3, fill='#006400', outline='')
+
+                # desenhar rótulos de tempo no eixo X (até 6 labels)
+                try:
+                    num_ticks = min(6, max(2, int(plot_w // 120)))
+                    for i in range(num_ticks):
+                        frac = i / (num_ticks - 1) if num_ticks > 1 else 0.5
+                        tick_ts = min_ts + frac * span
+                        x = time_to_x(tick_ts)
+                        # escolher formato dependendo do span
+                        if span > 86400 * 2:
+                            fmt = '%d/%m %H:%M'
+                        else:
+                            fmt = '%H:%M'
+                        label = datetime.fromtimestamp(tick_ts).strftime(fmt)
+                        canvas.create_text(x, h - 4, text=label, anchor='s', font=('Segoe UI', 7), fill='#666')
+                        # pequena marca no eixo
+                        canvas.create_line(x, h - bottom, x, h - bottom + 4, fill='#ccc')
+                except Exception:
+                    pass
+
+                # desenhar texto resumo do último pico por hora (hora e valores)
+                try:
+                    last_idx = len(times) - 1
+                    last_hour_ts = times[last_idx]
+                    last_t = temps[last_idx]
+                    last_u = ums[last_idx]
+                    if last_hour_ts is not None:
+                        label_time = last_hour_ts.strftime('%Y-%m-%d %H:00')
+                        txt = f"Último pico hora {label_time}: T {last_t:.1f}°C  H {last_u:.1f}%"
+                        canvas.create_text(w - 8, 20, text=txt, anchor='ne', font=('Segoe UI', 8), fill='#444')
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # legenda simples
+        legend_x = left + 6
+        legend_y = h - bottom + 2
+        canvas.create_rectangle(legend_x, legend_y-8, legend_x+12, legend_y+4, fill='#c00000', outline='')
+        canvas.create_text(legend_x+16, legend_y, text='Temperatura (°C)', anchor='w', font=('Segoe UI', 8))
+        canvas.create_rectangle(legend_x+150, legend_y-8, legend_x+162, legend_y+4, fill='#007f00', outline='')
+        canvas.create_text(legend_x+166, legend_y, text='Umidade (%)', anchor='w', font=('Segoe UI', 8))
+
+    except Exception:
+        pass
+
+def _draw_charts():
+    _draw_combined_chart(combined_chart_canvas, list(temp_history), list(umid_history))
 
 obter_dados()
 # garantir parada de threads ao fechar
@@ -1421,4 +1765,11 @@ def _on_close():
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
-root.mainloop()
+
+
+if __name__ == '__main__':
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        # permite encerrar com Ctrl+C quando executado a partir do terminal
+        _on_close()
