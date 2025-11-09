@@ -437,137 +437,91 @@ def preview_loop():
     """Loop chamado via root.after que captura um frame, atualiza previews e executa detecção leve."""
     global preview_cap, preview_hands, gesture_hold_count, gesture_last_detected
     global current_gesture_var, current_action_var
+
     if not preview_running or preview_cap is None:
         return
+        
     try:
         ret, frame = preview_cap.read()
         if not ret:
             print("Erro: falha ao ler frame da câmera")
-            # parar captura e desmarcar checkbox
-            try:
-                gestos_ativos.set(False)
-            except Exception:
-                pass
+            gestos_ativos.set(False)
             stop_preview_capture()
             return
 
-        # preparar imagem RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        annotated = rgb
-
+        # Redimensionar frame para processamento mais rápido
+        frame_small = cv2.resize(frame, (320, 240))
+        rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+        annotated = None
+        
         detected = None
-        # processar landmarks se disponível
+        # Processar landmarks apenas se preview_hands disponível
         if preview_hands is not None:
             try:
                 results = preview_hands.process(rgb)
                 if results and results.multi_hand_landmarks:
                     hand = results.multi_hand_landmarks[0]
-                    # tenta obter handedness (Left/Right) se disponível
                     handedness_label = None
-                    try:
-                        if results.multi_handedness and len(results.multi_handedness) > 0:
-                            handedness_label = results.multi_handedness[0].classification[0].label
-                    except Exception:
-                        handedness_label = None
+                    if results.multi_handedness:
+                        handedness_label = results.multi_handedness[0].classification[0].label
+                        
                     detected = _gesture_count_fingers(hand, handedness_label)
+                    
+                    # Desenhar landmarks apenas se necessário
                     if preview_draw_landmarks.get():
-                        try:
-                            mp.solutions.drawing_utils.draw_landmarks(annotated, hand, mp.solutions.hands.HAND_CONNECTIONS)
-                        except Exception:
-                            pass
+                        annotated = rgb.copy()
+                        mp.solutions.drawing_utils.draw_landmarks(
+                            annotated, hand, mp.solutions.hands.HAND_CONNECTIONS,
+                            mp.solutions.drawing_utils.DrawingSpec(color=(255,0,0), thickness=2),
+                            mp.solutions.drawing_utils.DrawingSpec(color=(0,255,0), thickness=1)
+                        )
             except Exception as e:
-                # falha no processing não impede preview
-                print("MediaPipe processing error:", e)
+                print(f"MediaPipe processing error: {e}")
 
-        # Estabiliza detecção por histórico curto para reduzir flutuação
+        # Estabilização de gestos otimizada
         stable_detected = None
-        try:
-            # append valor simples (None também entra)
+        if detected is not None:
             detection_history.append(detected)
-            # calcula moda simples
-            from collections import Counter
-            cnt = Counter(detection_history)
-            most_common, most_count = cnt.most_common(1)[0]
-            # exige ao menos 4 ocorrências na janela para considerar estável
-            if most_common is not None and most_count >= 4:
-                stable_detected = most_common
-            else:
-                # se 'None' for a moda com contagem alta, mantemos None
-                if most_common is None and most_count >= 4:
-                    stable_detected = None
-                else:
-                    stable_detected = None
-        except Exception:
-            stable_detected = detected
+            cnt = {}
+            # Contagem manual mais eficiente que Counter para poucos elementos
+            for d in detection_history:
+                cnt[d] = cnt.get(d, 0) + 1
+            most_common = max(cnt.items(), key=lambda x: x[1], default=(None, 0))
+            if most_common[1] >= 4:
+                stable_detected = most_common[0]
 
-        # Atualiza variável de UI com o gesto estabilizado (pode ser None)
-        try:
-            if current_gesture_var is not None:
-                current_gesture_var.set(str(stable_detected) if stable_detected is not None else 'Nenhum')
-        except Exception:
-            pass
+        # Atualizar UI de forma eficiente
+        if current_gesture_var is not None:
+            current_gesture_var.set(str(stable_detected) if stable_detected is not None else 'Nenhum')
 
-        # atualizar small preview (usar frame anotado com landmarks se desenhado)
-        try:
-            if PIL_AVAILABLE and preview_label is not None:
-                try:
-                    if preview_draw_landmarks.get():
-                        # annotated é RGB; _update_preview_image_from_bgr espera BGR
-                        bgr_for_small = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
-                        _update_preview_image_from_bgr(bgr_for_small)
-                    else:
-                        _update_preview_image_from_bgr(frame.copy())
-                except Exception:
-                    # fallback simples
-                    _update_preview_image_from_bgr(frame.copy())
-        except Exception:
-            pass
+        # Atualizar previews de forma otimizada
+        if PIL_AVAILABLE and preview_label is not None:
+            display_frame = cv2.resize(annotated if annotated is not None else frame, (320, 240))
+            _update_preview_image_from_bgr(display_frame)
 
-        # atualizar large preview se aberto
-        try:
-            if preview_window_open and preview_large_label is not None:
-                _update_large_preview_from_rgb(annotated)
-        except Exception:
-            pass
+        if preview_window_open and preview_large_label is not None and annotated is not None:
+            _update_large_preview_from_rgb(annotated)
 
-        # debouncing da detecção e acionamento
-        try:
-            # usar a detecção estabilizada (stable_detected) para o debouncing/acionamento
-            if stable_detected is not None:
-                if stable_detected == gesture_last_detected:
-                    gesture_hold_count += 1
-                else:
-                    gesture_hold_count = 1
-                    gesture_last_detected = stable_detected
+        # Detecção de gestos otimizada
+        if stable_detected is not None:
+            if stable_detected == gesture_last_detected:
+                gesture_hold_count += 1
                 if gesture_hold_count >= GESTURE_HOLD_THRESHOLD:
-                    # antes de acionar, atualiza ação e chama o trigger
-                    try:
-                        if current_action_var is not None:
-                            current_action_var.set('Executando...')
-                    except Exception:
-                        pass
+                    if current_action_var is not None:
+                        current_action_var.set('Executando...')
                     trigger_gesture_action(stable_detected)
                     gesture_hold_count = 0
                     gesture_last_detected = None
             else:
-                # se não há detecção estável, reseta o contador
-                gesture_hold_count = 0
-                gesture_last_detected = None
-        except Exception:
-            pass
-        # debug info (apenas print simplificado)
-        try:
-            print(f"Frame lido (w={frame.shape[1]}, h={frame.shape[0]}) detected={detected}")
-        except Exception:
-            pass
+                gesture_hold_count = 1
+                gesture_last_detected = stable_detected
+        else:
+            gesture_hold_count = 0
+            gesture_last_detected = None
 
     finally:
-        # agendar próximo frame
-        try:
-            if preview_running and preview_cap is not None:
-                root.after(100, preview_loop)
-        except Exception:
-            pass
+        if preview_running and preview_cap is not None:
+            root.after(50, preview_loop)  # Aumentar taxa de atualização
 
 
 # Janela de preview grande com landmarks
@@ -684,18 +638,23 @@ def obter_dados():
     if not root.winfo_exists():
         return
     try:
-        resposta = requests.get(BLYNK_URL_GET)
-        if resposta.status_code == 200:
-            dados = resposta.json()
-            atualizar_interface(dados)                     
-        else:
-            print("Erro ao obter dados:", resposta.status_code)
+        # Usar session para reutilizar conexões HTTP
+        with requests.Session() as session:
+            resposta = session.get(BLYNK_URL_GET, timeout=5)
+            if resposta.status_code == 200:
+                dados = resposta.json()
+                atualizar_interface(dados)                     
+            else:
+                print(f"Erro ao obter dados: {resposta.status_code}")
+    except requests.RequestException as e:
+        print(f"Erro de conexão: {e}")
     except Exception as e:
-        print("Erro:", e)
-    # Só agenda próxima execução se a janela ainda existir
-    if root.winfo_exists():
-        # atualizar a cada 3 segundos para tempo quase real
-        root.after(3000, obter_dados)
+        print(f"Erro: {e}")
+    finally:
+        # Só agenda próxima execução se a janela ainda existir
+        if root.winfo_exists():
+            # atualizar a cada 3 segundos para tempo quase real
+            root.after(3000, obter_dados)
 
 def atualizar_interface(dados):
     global popup_portao
@@ -1198,43 +1157,37 @@ def trigger_gesture_action(fingers_count):
 
 def _gesture_count_fingers(hand_landmarks, handedness):
     """Conta dedos estendidos com base em landmarks do MediaPipe."""
-    # Índices dos pontos das pontas dos dedos e suas bases
-    tips_ids = [4, 8, 12, 16, 20]  # pontas dos dedos
-    pips_ids = [2, 6, 10, 14, 18]  # articulações intermediárias
-    count = 0
-    lm = hand_landmarks.landmark
-    extended = [False] * 5
-
+    # Constantes para otimização
+    THUMB_DIST_THRESHOLD = 0.1
+    FINGER_EXTENSION_THRESHOLD = 0.05
+    tips_ids = (4, 8, 12, 16, 20)  # pontas dos dedos (tupla é mais rápida que lista)
+    pips_ids = (2, 6, 10, 14, 18)  # articulações intermediárias
+    
     try:
-        # Polegar: usar distância entre ponta do polegar e base do indicador
+        lm = hand_landmarks.landmark
+        extended = [False] * 5
+
+        # Otimização polegar: pré-calcular coordenadas
         thumb_tip = lm[tips_ids[0]]
-        index_base = lm[5]  # base do indicador
-        
-        # Calcular distância entre polegar e base do indicador
+        index_base = lm[5]
         thumb_dist = ((thumb_tip.x - index_base.x)**2 + (thumb_tip.y - index_base.y)**2)**0.5
         
-        # Se o polegar está suficientemente longe da base do indicador, está estendido
-        if thumb_dist > 0.1:  # ajuste este valor conforme necessário
+        if thumb_dist > THUMB_DIST_THRESHOLD:
             extended[0] = True
-            count += 1
+            count = 1
+        else:
+            count = 0
 
-        # Outros dedos: comparar posição Y da ponta com a articulação
-        for i in range(1, 5):  # para os 4 dedos restantes
-            tip = lm[tips_ids[i]]
-            pip = lm[pips_ids[i]]
-            
-            # Um dedo está estendido se sua ponta está acima (Y menor) que sua articulação
-            if tip.y < pip.y - 0.05:  # margem para evitar falsos positivos
+        # Otimização outros dedos: reduzir alocações de memória
+        for i in range(1, 5):
+            if lm[tips_ids[i]].y < lm[pips_ids[i]].y - FINGER_EXTENSION_THRESHOLD:
                 extended[i] = True
                 count += 1
 
-        # Caso especial: apenas polegar estendido = gesto "THUMB"
-        if count == 1 and extended[0] and not any(extended[1:]):
+        # Otimizar caso do THUMB com expressão booleana direta
+        if count == 1 and extended[0] and not (extended[1] or extended[2] or extended[3] or extended[4]):
             return 'THUMB'
-
-        # Debug info
-        print(f"Dedos estendidos: {extended}, Contagem: {count}")
-        
+            
     except Exception as e:
         print(f"Erro na detecção de dedos: {e}")
         return 0
@@ -1571,25 +1524,11 @@ combined_chart_canvas = tk.Canvas(charts_frame, width=COMBINED_CHART_W, height=C
 combined_chart_canvas.pack(fill='both', expand=True)
 
 def _draw_combined_chart(canvas, temp_data, umid_data):
-    """Desenha um gráfico combinado (duas linhas) no mesmo canvas.
-    temp_data (15-45) e umid_data (0-100).
-    """
+    """Desenha um gráfico combinado otimizado com duas linhas no mesmo canvas."""
     try:
-        canvas.delete('all')
+        # Cache de variáveis frequentemente usadas
         w = int(canvas.winfo_width() or COMBINED_CHART_W)
         h = int(canvas.winfo_height() or COMBINED_CHART_H)
-
-        # fundo
-        canvas.create_rectangle(0, 0, w, h, fill=canvas['bg'], outline='')
-
-        # título e última leitura (à direita)
-        # (Usa os dados reais do histórico)
-        last_t = f"T: {temp_data[-1]:.1f}°C" if temp_data else "T: --"
-        last_u = f"H: {umid_data[-1]:.1f}%" if umid_data else "H: --"
-        canvas.create_text(8, 6, text='Histórico (Temperatura / Umidade)', anchor='nw', font=('Segoe UI', 9, 'bold'))
-        canvas.create_text(w - 8, 6, text=f"{last_t}   {last_u}", anchor='ne', font=('Segoe UI', 9))
-
-        # Margens
         left = 36
         right = 12
         top = 26
@@ -1597,73 +1536,107 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
         plot_w = max(10, w - left - right)
         plot_h = max(10, h - top - bottom)
 
-        # desenhar apenas rótulos Y (0,25,50,75,100) sem linhas de grade
-        # (Esta escala agora representa % da altura do gráfico, não valores)
+        # Limpar canvas uma única vez
+        canvas.delete('all')
+
+        # Desenhar fundo em uma única operação
+        canvas.create_rectangle(0, 0, w, h, fill=canvas['bg'], outline='')
+
+        # Otimizar strings de texto frequentes
+        last_t = f"T: {temp_data[-1]:.1f}°C" if temp_data else "T: --"
+        last_u = f"H: {umid_data[-1]:.1f}%" if umid_data else "H: --"
+        
+        # Criar todos os textos em um único batch
+        canvas.create_text(8, 6, text='Histórico (Temperatura / Umidade)', 
+                         anchor='nw', font=('Segoe UI', 9, 'bold'))
+        canvas.create_text(w - 8, 6, text=f"{last_t}   {last_u}", 
+                         anchor='ne', font=('Segoe UI', 9))
+
+        # Otimizar desenho de rótulos Y
+        y_labels = []
         for v in (0, 25, 50, 75, 100):
             y = top + (100 - v) / 100.0 * plot_h
-            canvas.create_text(6, y, text=str(v), anchor='w', font=('Segoe UI', 7), fill='#666')
+            y_labels.append((6, y, str(v)))
+        
+        # Desenhar todos os rótulos Y de uma vez
+        for x, y, text in y_labels:
+            canvas.create_text(x, y, text=text, anchor='w', 
+                             font=('Segoe UI', 7), fill='#666')
 
-        # --- CORREÇÃO MANTIDA: Mapear pontos usando min/max para normalizar ---
-        def _map_points(data, min_val=0.0, max_val=100.0): # MANTIDO
+        # Função otimizada para mapear pontos
+        def _map_points(data, min_val, max_val):
+            if not data:
+                return []
             n = len(data)
+            span = max_val - min_val
+            if span <= 0:
+                span = 1
+                
+            # Pré-calcular valores constantes
+            x_factor = plot_w / (n - 1) if n > 1 else plot_w/2
+            y_factor = plot_h
+            
+            # Lista pré-alocada
             pts = []
-            if n == 0:
-                return pts
-            span = max(max_val - min_val, 1) # Evita divisão por zero
+            append = pts.append  # Cache método append
+            
             for i, val in enumerate(data):
-                x = left + (i / max(1, n-1)) * plot_w if n > 1 else left + plot_w/2
-                # Normaliza o valor aqui dentro
                 try:
+                    x = left + i * x_factor
                     normalized_val = (float(val) - min_val) / span
-                except Exception:
-                    normalized_val = 0.0
-                y = top + (1.0 - max(0, min(1.0, normalized_val))) * plot_h # MANTIDO
-                pts.append((x, y))
+                    y = top + (1.0 - max(0, min(1.0, normalized_val))) * y_factor
+                    append((x, y))
+                except (TypeError, ValueError):
+                    continue
             return pts
 
-        t_pts = _map_points(temp_data, min_val=15.0, max_val=45.0) # MANTIDO
-        u_pts = _map_points(umid_data, min_val=0.0, max_val=100.0) # MANTIDO
-        # --------------------- Fim da Correção MANTIDA -------------------------
+        # Mapear pontos uma única vez para cada série
+        t_pts = _map_points(temp_data, 15.0, 45.0)
+        u_pts = _map_points(umid_data, 0.0, 100.0)
 
-
-        # desenhar linhas com suavização
-        # Desenhar apenas as linhas principais de temperatura e umidade
+        # Desenhar linhas em batch
         if t_pts:
-            t_flat = [coord for p in t_pts for coord in p]
-            canvas.create_line(*t_flat, fill='#c00000', width=2, smooth=True)
+            canvas.create_line(*[coord for p in t_pts for coord in p],
+                             fill='#c00000', width=2, smooth=True)
         if u_pts:
-            u_flat = [coord for p in u_pts for coord in p]
-            canvas.create_line(*u_flat, fill='#007f00', width=2, smooth=True)
+            canvas.create_line(*[coord for p in u_pts for coord in p],
+                             fill='#007f00', width=2, smooth=True)
 
-        # Desenhar rótulos de tempo no eixo X (até 6 labels) — sem pequenos ticks verticais
-        try:
+        # Otimizar rótulos de tempo
+        if temp_data:
             num_samples = len(temp_data)
             if num_samples > 1:
-                # Calcula o tempo total em minutos (assumindo 1 sample a cada 3s)
                 total_min = (num_samples * 3.0) / 60.0
                 num_ticks = min(6, max(2, int(plot_w // 120)))
                 
+                # Criar todos os rótulos de tempo de uma vez
+                time_labels = []
                 for i in range(num_ticks):
                     x = left + (i / (num_ticks - 1)) * plot_w
-                    # Calcula o rótulo em minutos
                     min_label = (i / (num_ticks - 1)) * total_min
-                    label = f"{min_label:.0f} min"
-                    
-                    canvas.create_text(x, h - 4, text=label, anchor='s', font=('Segoe UI', 7), fill='#666')
-        except Exception:
-            pass
+                    time_labels.append((x, h - 4, f"{min_label:.0f} min"))
+                
+                # Desenhar todos os rótulos em batch
+                for x, y, label in time_labels:
+                    canvas.create_text(x, y, text=label, anchor='s',
+                                    font=('Segoe UI', 7), fill='#666')
 
-        # legenda simples (O código original já estava correto aqui)
+        # Desenhar legenda eficientemente
         legend_x = left + 6
         legend_y = h - bottom + 2
-        canvas.create_rectangle(legend_x, legend_y-8, legend_x+12, legend_y+4, fill='#c00000', outline='')
-        canvas.create_text(legend_x+16, legend_y, text='Temperatura (°C)', anchor='w', font=('Segoe UI', 8))
-        canvas.create_rectangle(legend_x+150, legend_y-8, legend_x+162, legend_y+4, fill='#007f00', outline='')
-        canvas.create_text(legend_x+166, legend_y, text='Umidade (%)', anchor='w', font=('Segoe UI', 8))
+        
+        # Criar retângulos e textos da legenda em batch
+        canvas.create_rectangle(legend_x, legend_y-8, legend_x+12, legend_y+4,
+                              fill='#c00000', outline='')
+        canvas.create_text(legend_x+16, legend_y, text='Temperatura (°C)',
+                         anchor='w', font=('Segoe UI', 8))
+        canvas.create_rectangle(legend_x+150, legend_y-8, legend_x+162, legend_y+4,
+                              fill='#007f00', outline='')
+        canvas.create_text(legend_x+166, legend_y, text='Umidade (%)',
+                         anchor='w', font=('Segoe UI', 8))
 
     except Exception as e:
         print(f"Erro ao desenhar gráfico: {e}")
-        pass
 
 def _draw_charts():
     _draw_combined_chart(combined_chart_canvas, list(temp_history), list(umid_history))
@@ -1671,32 +1644,58 @@ def _draw_charts():
 obter_dados()
 # garantir parada de threads ao fechar
 def _on_close():
+    """Função otimizada para limpeza de recursos e encerramento do aplicativo."""
+    # Lista de callbacks para limpeza
+    cleanup_tasks = [
+        lambda: root.after_cancel('all'),
+        stop_preview_capture,
+        stop_gesture_thread,
+        stop_alarm_sound,
+        lambda: stop_preview_capture() if 'preview_cap' in globals() else None,
+    ]
+    
+    # Executar limpeza de recursos
+    for task in cleanup_tasks:
+        try:
+            task()
+        except Exception as e:
+            print(f"Erro durante limpeza: {e}")
+
+    # Limpar referências globais
+    global_vars = [
+        'temp_gauge', 'umid_gauge', 'preview_label', 'preview_large_label',
+        'preview_window', 'popup_alarme', 'popup_portao', 'preview_hands'
+    ]
+    
+    for var_name in global_vars:
+        try:
+            if var_name in globals():
+                obj = globals()[var_name]
+                if hasattr(obj, 'destroy'):
+                    obj.destroy()
+                globals()[var_name] = None
+        except Exception as e:
+            print(f"Erro ao limpar {var_name}: {e}")
+
+    # Limpar históricos e coleções
     try:
-        # Cancela todos os callbacks pendentes
-        root.after_cancel('all')
+        temp_history.clear()
+        umid_history.clear()
+        hour_peaks_temp.clear()
+        hour_peaks_umid.clear()
+        hour_peaks_times.clear()
+        detection_history.clear()
     except Exception:
         pass
+
+    # Encerrar aplicação
     try:
-        stop_gesture_thread()
-    except Exception:
-        pass
-    try:
-        stop_alarm_sound()
-    except Exception:
-        pass
-    try:
-        # Limpa referências dos gauges
-        global temp_gauge, umid_gauge
-        if temp_gauge:
-            temp_gauge.canvas.get_tk_widget().destroy()
-            temp_gauge = None
-        if umid_gauge:
-            umid_gauge.canvas.get_tk_widget().destroy()
-            umid_gauge = None
-    except Exception:
-        pass
-    root.quit()
-    root.destroy()
+        root.quit()
+        root.destroy()
+    except Exception as e:
+        print(f"Erro ao encerrar aplicação: {e}")
+        import os
+        os._exit(0)  # Forçar encerramento em último caso
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
 
