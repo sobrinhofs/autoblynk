@@ -161,8 +161,31 @@ style.configure("TFrame", background="white")
 style.configure("TLabelframe", background="white")
 style.configure("TLabelframe.Label", background="white")
 
+# Função para formatar setpoint ao pressionar Enter
+def format_setpoint(event):
+    """Formata o valor do setpoint para uma casa decimal quando pressionar Enter"""
+    try:
+        value = float(event.widget.get())
+        if value > 100:
+            value = 100.0
+        elif value < 0:
+            value = 0.0
+        formatted = f"{value:.1f}"
+        event.widget.delete(0, 'end')
+        event.widget.insert(0, formatted)
+    except ValueError:
+        pass
+    return "break"  # Impede o comportamento padrão do Enter
+
+# Variáveis para os setpoints
 setpoint_temp = tk.DoubleVar(value=35.0)
 setpoint_umid = tk.DoubleVar(value=20.0)
+rele_alarme_temp = tk.StringVar(value='Nenhum')
+rele_alarme_umid = tk.StringVar(value='Nenhum')
+
+# Criar variáveis para os setpoints
+setpoint_temp = tk.StringVar(value="35.0")
+setpoint_umid = tk.StringVar(value="20.0")
 rele_alarme_temp = tk.StringVar(value='Nenhum')
 rele_alarme_umid = tk.StringVar(value='Nenhum')
 
@@ -215,7 +238,11 @@ frame_temp = tb.LabelFrame(frame_home, text="Temperatura", bootstyle="secondary"
 frame_temp.pack(fill='x', pady=(20, 10), padx=20)
 tb.Label(frame_temp, textvariable=temperatura_var, font=("Segoe UI", 16, 'bold'), bootstyle="warning").grid(row=0, column=0, sticky='w', padx=5)
 tb.Label(frame_temp, text="Setpoint:", bootstyle="warning").grid(row=0, column=1, padx=5)
-tb.Entry(frame_temp, textvariable=setpoint_temp, width=6, font=("Segoe UI", 12)).grid(row=0, column=2, padx=5)
+tb.Label(frame_temp, text="Setpoint:", bootstyle="warning").grid(row=0, column=1, padx=5)
+entry_temp = tb.Entry(frame_temp, textvariable=setpoint_temp, width=6, font=("Segoe UI", 12))
+entry_temp.grid(row=0, column=2, padx=5)
+entry_temp.bind('<Return>', format_setpoint)
+
 tb.Label(frame_temp, text="Relé:", bootstyle="warning").grid(row=0, column=3, padx=5)
 tb.Combobox(frame_temp, values=RELES_LIST, textvariable=rele_alarme_temp, width=10, font=("Segoe UI", 12), state="readonly").grid(row=0, column=4, padx=5)
 
@@ -223,7 +250,9 @@ frame_umid = tb.LabelFrame(frame_home, text="Umidade", bootstyle="secondary", pa
 frame_umid.pack(fill='x', pady=(0, 20), padx=20)
 tb.Label(frame_umid, textvariable=umidade_var, font=("Segoe UI", 16, 'bold'), bootstyle="info").grid(row=0, column=0, sticky='w', padx=5)
 tb.Label(frame_umid, text="Setpoint:", bootstyle="info").grid(row=0, column=1, padx=5)
-tb.Entry(frame_umid, textvariable=setpoint_umid, width=6, font=("Segoe UI", 12)).grid(row=0, column=2, padx=5)
+entry_umid = tb.Entry(frame_umid, textvariable=setpoint_umid, width=6, font=("Segoe UI", 12))
+entry_umid.grid(row=0, column=2, padx=5)
+entry_umid.bind('<Return>', format_setpoint)
 tb.Label(frame_umid, text="Relé:", bootstyle="info").grid(row=0, column=3, padx=5)
 tb.Combobox(frame_umid, values=RELES_LIST, textvariable=rele_alarme_umid, width=10, font=("Segoe UI", 12), state="readonly").grid(row=0, column=4, padx=5)
 
@@ -766,7 +795,8 @@ def atualizar_interface(dados):
     # Checa alarmes
     try:
         temp = float(temperatura)
-        if temp >= setpoint_temp.get() and rele_alarme_temp.get() != "Nenhum":
+        setpoint_temp_val = float(setpoint_temp.get())
+        if temp >= setpoint_temp_val and rele_alarme_temp.get() != "Nenhum":
             frame_temp.config(bootstyle="danger")
             acionar_rele_alarme(rele_alarme_temp.get())
             mostrar_alarme("ATENÇÃO!\nTemperatura Alta")
@@ -776,11 +806,12 @@ def atualizar_interface(dados):
         frame_temp.config(bootstyle="secondary")
     try:
         umid = float(umidade)
-        if umid >= setpoint_umid.get() and rele_alarme_umid.get() != "Nenhum":
+        setpoint_umid_val = float(setpoint_umid.get())
+        if umid >= setpoint_umid_val and rele_alarme_umid.get() != "Nenhum":
             frame_umid.config(bootstyle="danger")
             acionar_rele_alarme(rele_alarme_umid.get())
             mostrar_alarme("ATENÇÃO!\nUmidade Relativa Alta")
-        elif umid < setpoint_umid.get() and alarme_ativo.get():  # Alarme de umidade baixa
+        elif umid < setpoint_umid_val and alarme_ativo.get():  # Alarme de umidade baixa
             mostrar_alarme("ATENÇÃO!\nUmidade Relativa Baixa")
             frame_umid.config(bootstyle="danger")
         else:
