@@ -1,3 +1,4 @@
+
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import tkinter as tk
@@ -21,6 +22,13 @@ try:
     from datetime import datetime
     from face_processor import FaceProcessor
     
+    # Inicializar logging do absl para suprimir warnings
+    try:
+        from absl import logging
+        logging.set_verbosity(logging.ERROR)  # Reduz nível de logging
+    except ImportError:
+        pass
+        
     GESTURE_AVAILABLE = True
     
     # Inicializar o processador de face
@@ -528,9 +536,6 @@ tb.Label(leg_frame, text="OFF", bootstyle="danger", anchor='center', width=6).gr
 preview_label = None
 preview_cap = None
 # Ajuste de tamanho padrão solicitado: 400 x 350
-# preview size defaults
-preview_width_var = tk.IntVar(value=400)
-preview_height_var = tk.IntVar(value=350)
 # seleção de índice da câmera
 camera_index_var = tk.IntVar(value=0)
 preview_hands = None
@@ -560,7 +565,13 @@ def start_preview_capture(camera_index=0):
     # criar objeto MediaPipe para preview/detecção, se disponível
     if GESTURE_AVAILABLE and mp is not None:
         try:
-            preview_hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.6)
+            # Configurar Hands com dimensões da imagem para evitar warning do landmark_projection
+            preview_hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                model_complexity=0  # Usar modelo mais leve
+            )
         except Exception:
             preview_hands = None
     else:
@@ -801,15 +812,15 @@ def close_preview_window():
 preview_row = tb.Frame(controls_frame)
 preview_row.pack(pady=(8,6))
 
-# Preview (pequeno) dentro da linha
-preview_small_frame = tb.Frame(preview_row, width=preview_width_var.get(), height=preview_height_var.get())
+# Preview (pequeno) dentro da linha - tamanho fixo 400x350
+preview_small_frame = tb.Frame(preview_row, width=400, height=350)
 preview_small_frame.pack(side='left')
 preview_small_frame.pack_propagate(False)
 preview_label = tk.Label(preview_small_frame, text="Preview\n(inativo)", bg="#000", fg="#fff")
 preview_label.pack(fill='both', expand=True)
 
 # Painel de debug ao lado do preview: mostra gesto detectado e ação tomada
-debug_frame = tb.Frame(preview_row, width=200, height=preview_height_var.get(), padding=6)
+debug_frame = tb.Frame(preview_row, width=200, height=350, padding=6)
 debug_frame.pack(side='left', padx=(8,0))
 debug_frame.pack_propagate(False)
 
@@ -830,16 +841,7 @@ tb.Label(debug_frame, text="Ação tomada:", font=("Segoe UI", 9)).pack(anchor='
 lbl_acao = tb.Label(debug_frame, textvariable=current_action_var, font=("Segoe UI", 10))
 lbl_acao.pack(anchor='w')
 
-# Controls para ajustar tamanho do preview (largura x altura)
-size_frame = tb.Frame(controls_frame)
-size_frame.pack(pady=(2,6))
-tb.Label(size_frame, text="Preview size:", font=("Segoe UI", 9)).pack(side='left', padx=(0,6))
-spin_w = tk.Spinbox(size_frame, from_=80, to=640, width=5, textvariable=preview_width_var)
-spin_w.pack(side='left')
-tk.Label(size_frame, text="x").pack(side='left')
-spin_h = tk.Spinbox(size_frame, from_=60, to=480, width=5, textvariable=preview_height_var)
-spin_h.pack(side='left', padx=(0,6))
-    # 'Desenhar landmarks' foi movido para a barra superior (frame_tema)
+# 'Desenhar landmarks' foi movido para a barra superior (frame_tema)
 
 # Nota: use apenas o Checkbutton 'Gestos Ativados' para abrir/fechar o preview.
 
@@ -850,10 +852,8 @@ tb.Label(cam_frame, text="Camera index:", font=("Segoe UI", 9)).pack(side='left'
 spin_idx = tk.Spinbox(cam_frame, from_=0, to=4, width=4, textvariable=camera_index_var)
 spin_idx.pack(side='left', padx=(4,8))
 
-# ligar trace para reagir a mudanças do índice e redimensionamento do preview
+# ligar trace para reagir a mudanças do índice da câmera
 camera_index_var.trace_add('write', lambda *a: _on_camera_index_change())
-preview_width_var.trace_add('write', lambda *a: preview_small_frame.config(width=int(preview_width_var.get())))
-preview_height_var.trace_add('write', lambda *a: preview_small_frame.config(height=int(preview_height_var.get())))
 
 # --- Funções principais ---
 def obter_dados():
@@ -887,19 +887,18 @@ def atualizar_interface(dados):
     
     t = _to_float(temperatura)
     if t is not None:
-        # tc é o valor real da temperatura (24.5)
-        tc = max(0.0, min(100.0, t)) 
-
-        # >>> CORREÇÃO: Inverter o valor para compensar o bug de inversão no DialGauge
-         # Se o gauge está mostrando 100 - tc, precisamos enviar 100 - (100 - tc) para que a inversão dê o valor correto.
-        tc_inverted = 100.0 - tc
+        # tc é o valor real da temperatura (ex: 24.5°C)
+        tc = max(100.0, min(0.0, t))  # Limita entre 0 e 50°C
             
-        # Atualiza o label abaixo do gauge com o valor real
+        # Normaliza o valor real (0-50°C) para a escala visual do gauge (0-100)
+        tc_normalized = (tc / 50.0) * 100.0
+            
+        # Atualiza o label abaixo do gauge com o valor real em °C
         temp_value_var.set(f"{tc:.1f} °C") 
 
         if temp_gauge:
-            # Passa o valor invertido. O gauge (invertido) irá exibi-lo corretamente como 24.5.
-            temp_gauge.update(tc_inverted) # Corrigido para tc_inverted     
+            # Atualiza o gauge com o valor normalizado (0-100)
+            temp_gauge.update(tc_normalized)
 
     # Atualiza os gauges (se existirem) com os valores numéricos
     parsed_temp_val = None
@@ -914,7 +913,7 @@ def atualizar_interface(dados):
             # --- CORREÇÃO: Salvar 'tc' (real) no histórico ---
             try:
                 temp_history.append(tc) 
-                temp_normalized = (tc - 15.0) * (100.0 / 30.0)  # Valor normalizado (ex: 29.0)
+                #temp_normalized = (tc / 100.0) * 100.0
             except Exception:
                 temp_normalized = None
                 
@@ -1238,7 +1237,7 @@ def start_alarm_sound(filename='alarme.mp3'):
             if not os.path.exists(filename):
                 print(f"Erro Winsound: Arquivo de alarme não encontrado em {filename}")
                 return
-            # winsound requer WAV; se não for WAV, tenta tocar de qualquer forma (pode falhar)
+            # winsound requer WAV; se não for WAV, tenta tocar de qualquer forma
             winsound.PlaySound(filename, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
             sound_playing = True
             return
@@ -1341,7 +1340,7 @@ def trigger_gesture_action(fingers_count):
                 pass
             return
 
-        # Mapear contagens para relés individuais conforme solicitado
+        # Mapa contagens para relés individuais
         if fingers_count == 1:
             alternar_estado('v7')  # 1 dedo -> QUARTO (v7)
             print("Gesto: 1 dedo -> alterna QUARTO (v7)")
@@ -1432,13 +1431,8 @@ def _update_preview_image_from_bgr(bgr_frame):
         # converte BGR -> RGB
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
-        # redimensionar para caber no label (usar valores do spinbox)
-        try:
-            w = int(preview_width_var.get())
-            h = int(preview_height_var.get())
-        except Exception:
-            w, h = 220, 160
-        img.thumbnail((w, h))
+        # redimensionar para tamanho fixo 400x350
+        img.thumbnail((400, 350))
         imgtk = ImageTk.PhotoImage(image=img)
 
         def _setimg():
@@ -1543,14 +1537,18 @@ gauge_frame.pack(expand=True, fill='both', padx=20, pady=20)
 top_values_row = tb.Frame(gauge_frame)
 top_values_row.pack(fill='x', pady=(0,12))
 
-# Temperatura (à esquerda) — usar LabelFrame parecido com a aba Home, sem setpoint/relés
-temp_dashboard_frame = tb.LabelFrame(top_values_row, text="Temperatura", bootstyle="secondary", padding=6)
-temp_dashboard_frame.pack(side='left', expand=True, fill='x', padx=(0,8))
+# Frame para os gauges com tamanho fixo para garantir espaço suficiente
+gauge_container = tb.Frame(gauge_frame, height=320)  # Altura fixa para os gauges
+gauge_container.pack(fill='x', expand=True)
+gauge_container.pack_propagate(False)  # Impede que o frame encolha
+
+# Frames laterais para os gauges com tamanho fixo
+temp_dashboard_frame = tb.LabelFrame(gauge_container, text="Temperatura", bootstyle="secondary", padding=10)
+temp_dashboard_frame.pack(side='left', expand=True, fill='both', padx=(0,8))
 tb.Label(temp_dashboard_frame, textvariable=temperatura_var, font=("Segoe UI", 14, 'bold'), bootstyle="warning").pack(anchor='w')
 
-# Umidade (à direita) — LabelFrame como na Home
-umid_dashboard_frame = tb.LabelFrame(top_values_row, text="Umidade", bootstyle="secondary", padding=6)
-umid_dashboard_frame.pack(side='right', expand=True, fill='x', padx=(8,0))
+umid_dashboard_frame = tb.LabelFrame(gauge_container, text="Umidade", bootstyle="secondary", padding=10)
+umid_dashboard_frame.pack(side='right', expand=True, fill='both', padx=(8,0))
 tb.Label(umid_dashboard_frame, textvariable=umidade_var, font=("Segoe UI", 14, 'bold'), bootstyle="info").pack(anchor='e')
 
 # Frame interno para alinhar os gauges horizontalmente no centro
@@ -1640,10 +1638,12 @@ except ImportError:
 # Colocar cada gauge dentro do seu LabelFrame respectivo (Dashboard)
 # Assim os gauges ficam próximos aos valores/controles correspondentes
 
-temp_gauge = DialGauge(temp_dashboard_frame, 'Temperatura', 0, 0, 50, color='#c00000', size=220, unit=' °C', invert=True)
+# Configurar gauges com tamanho maior e sem inversão
+temp_gauge = DialGauge(temp_dashboard_frame, 'Temperatura', 0, 0, 50, color="#7f0000", unit=' °C', size=280, invert=False)  
 temp_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
 
-umid_gauge = DialGauge(umid_dashboard_frame, 'Umidade', 0, 0, 100, color='#007f00', size=220, unit=' %', invert=False)
+umid_gauge = DialGauge(umid_dashboard_frame, 'Umidade', 0, 0, 100, 
+                      color='#007f00', unit=' %', size=280, invert=False)
 umid_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
 
 # Labels de valor em tempo real (numérico) abaixo de cada gauge (opcional, duplicado com o texto interno)
@@ -1794,7 +1794,22 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
         def _map_points(data, min_val, max_val):
             if not data:
                 return []
-            n = len(data)
+                
+            # Filtrar valores None e inválidos
+            valid_data = []
+            for val in data:
+                try:
+                    if val is not None:
+                        fval = float(val)
+                        if min_val <= fval <= max_val:
+                            valid_data.append(fval)
+                except (TypeError, ValueError):
+                    continue
+            
+            if not valid_data:
+                return []
+                
+            n = len(valid_data)
             span = max_val - min_val
             if span <= 0:
                 span = 1
@@ -1807,14 +1822,12 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
             pts = []
             append = pts.append  # Cache método append
             
-            for i, val in enumerate(data):
-                try:
-                    x = left + i * x_factor
-                    normalized_val = (float(val) - min_val) / span
-                    y = top + (1.0 - max(0, min(1.0, normalized_val))) * y_factor
-                    append((x, y))
-                except (TypeError, ValueError):
-                    continue
+            for i, val in enumerate(valid_data):
+                x = left + i * x_factor
+                normalized_val = (val - min_val) / span
+                y = top + (1.0 - max(0, min(1.0, normalized_val))) * y_factor
+                append((x, y))
+            
             return pts
 
         # Mapear pontos uma única vez para cada série
@@ -1822,12 +1835,19 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
         u_pts = _map_points(umid_data, 0.0, 100.0)
 
         # Desenhar linhas em batch
-        if t_pts:
+        if len(t_pts) >= 2:  # Precisa de pelo menos 2 pontos para uma linha
             canvas.create_line(*[coord for p in t_pts for coord in p],
                              fill='#c00000', width=2, smooth=True)
-        if u_pts:
+        elif len(t_pts) == 1:  # Se tiver apenas um ponto, desenha um ponto
+            x, y = t_pts[0]
+            canvas.create_oval(x-2, y-2, x+2, y+2, fill='#c00000', outline='#c00000')
+
+        if len(u_pts) >= 2:  # Precisa de pelo menos 2 pontos para uma linha
             canvas.create_line(*[coord for p in u_pts for coord in p],
                              fill='#007f00', width=2, smooth=True)
+        elif len(u_pts) == 1:  # Se tiver apenas um ponto, desenha um ponto
+            x, y = u_pts[0]
+            canvas.create_oval(x-2, y-2, x+2, y+2, fill='#007f00', outline='#007f00')
 
         # Otimizar rótulos de tempo
         if temp_data:
