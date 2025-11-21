@@ -1,3 +1,4 @@
+
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 import tkinter as tk
@@ -9,17 +10,130 @@ from collections import deque
 import threading
 import os
 import platform
+import sys
 # Matplotlib removido — usamos ttkbootstrap.Meter (TTBGauge) em vez de AngularGauge
 
-# --- Reconhecimento de gestos (opcional: OpenCV + MediaPipe) ---
+# --- Reconhecimento de gestos e face (OpenCV + MediaPipe) ---
 try:
     import cv2
     import mediapipe as mp
+    import numpy as np
+    import os
+    # face_recognition é opcional (usado apenas para carregar encodings de faces)
+    try:
+        import face_recognition
+        FACE_RECOGNITION_AVAILABLE = True
+    except Exception:
+        face_recognition = None
+        FACE_RECOGNITION_AVAILABLE = False
+    from datetime import datetime
+    from face_processor import FaceProcessor
+    
+    # Inicializar logging do absl para suprimir warnings
+    try:
+        from absl import logging
+        logging.set_verbosity(logging.ERROR)  # Reduz nível de logging
+    except ImportError:
+        pass
+        
     GESTURE_AVAILABLE = True
-except Exception:
+    
+    # Inicializar o processador de face
+    face_processor = FaceProcessor()
+    FACE_DETECTION_AVAILABLE = True
+    print("Sistema de detecção facial inicializado")
+    
+except Exception as e:
+    print(f"Erro ao importar bibliotecas de reconhecimento: {e}")
     cv2 = None
     mp = None
+    face_processor = None
     GESTURE_AVAILABLE = False
+    FACE_DETECTION_AVAILABLE = False
+    FACE_RECOGNITION_AVAILABLE = False
+
+# Variáveis para detecção facial
+face_detected = False
+last_face_check = None
+FACE_CHECK_INTERVAL = 0.5  # Segundos entre verificações de face
+
+# Helper para localizar recursos quando empacotado com PyInstaller
+def resource_path(relative_path: str):
+    """Retorna o caminho absoluto de um recurso, compatível com PyInstaller (onefile/onefolder).
+    Usa sys._MEIPASS quando disponível; caso contrário usa o diretório do executável.
+    """
+    try:
+        base_path = sys._MEIPASS  # type: ignore[attr-defined]
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.join(base_path, relative_path)
+
+# Variáveis para reconhecimento facial
+# Diretório com as fotos das faces autorizadas (resolvido para pacotes PyInstaller)
+FACES_DIR = resource_path("faces")
+known_face_encodings = []
+known_face_names = []
+face_authorized = False  # Controle se face está autorizada
+last_face_check = None
+FACE_CHECK_INTERVAL = 2.0  # Segundos entre verificações de face
+
+# Carregar faces conhecidas
+def load_known_faces():
+    global known_face_encodings, known_face_names
+    if not FACE_RECOGNITION_AVAILABLE:
+        return
+        
+    try:
+        if not os.path.exists(FACES_DIR):
+            os.makedirs(FACES_DIR)
+            print(f"Diretório {FACES_DIR} criado. Adicione fotos de faces autorizadas.")
+            return
+            
+        for filename in os.listdir(FACES_DIR):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                image_path = os.path.join(FACES_DIR, filename)
+                try:
+                    # Carregar imagem e encontrar encoding da face
+                    face_image = face_recognition.load_image_file(image_path)
+                    face_encoding = face_recognition.face_encodings(face_image)
+                    
+                    if face_encoding:  # Se encontrou face na imagem
+                        known_face_encodings.append(face_encoding[0])
+                        # Nome será o nome do arquivo sem extensão
+                        name = os.path.splitext(filename)[0]
+                        known_face_names.append(name)
+                        print(f"Face carregada: {name}")
+                except Exception as e:
+                    print(f"Erro ao carregar face {filename}: {e}")
+                    
+        print(f"Total de faces carregadas: {len(known_face_encodings)}")
+    except Exception as e:
+        print(f"Erro ao carregar faces: {e}")
+
+# Função para detectar face usando o processador facial
+def check_face_detection(frame):
+    """
+    Detecta faces usando o processador facial avançado.
+    Retorna True se uma face foi detectada e autorizada.
+    """
+    global face_detected, face_authorized
+    
+    if not FACE_DETECTION_AVAILABLE or face_processor is None:
+        return True  # Se detecção não disponível, permite gestos
+    
+    try:
+        # Processar o frame com o detector facial avançado
+        face_detected, annotated_frame = face_processor.process_frame(frame)
+        
+        # Se o frame foi anotado, substituir o frame original
+        if annotated_frame is not None:
+            frame[:] = annotated_frame[:]
+        
+        return face_detected
+        
+    except Exception as e:
+        print(f"Erro na detecção facial: {e}")
+        return False  # Em caso de erro, não autoriza
 
 try:
     from PIL import Image, ImageTk
@@ -120,8 +234,36 @@ def _apply_gauge_color(gauge, color):
     return False
 
 BLYNK_TOKEN = '_Cm7fdhv3ndn2LobfQwCxsgn4cTNxO1d'
-BLYNK_URL_GET = f'https://blynk.cloud/external/api/getAll?token={BLYNK_TOKEN}'
-BLYNK_URL_SET = f'https://blynk.cloud/external/api/update'
+# URLs sem token (para evitar inclusão acidental em logs). O token será passado via params.
+BLYNK_BASE = 'https://blynk.cloud/external/api'
+BLYNK_URL_GET = f"{BLYNK_BASE}/getAll"
+BLYNK_URL_SET = f"{BLYNK_BASE}/update"
+
+
+def _mask_token(s: str):
+    """Substitui ocorrências do token por um placeholder para evitar vazamento em logs."""
+    try:
+        if not s:
+            return s
+        return s.replace(BLYNK_TOKEN, '<REDACTED_TOKEN>')
+    except Exception:
+        return '<REDACTED_TOKEN>'
+
+
+def safe_get(url, params=None, timeout=5, **kwargs):
+    """Faz um requests.get de forma segura, mascarando o token em mensagens de erro.
+
+    Retorna o objeto Response em caso de sucesso, ou None em caso de falha.
+    """
+    try:
+        # Não logamos o URL com token; passamos o token via params.
+        return requests.get(url, params=params, timeout=timeout, **kwargs)
+    except Exception as e:
+        try:
+            print(f"Erro de conexão: {_mask_token(str(e))}")
+        except Exception:
+            print("Erro de conexão: <REDACTED_TOKEN>")
+        return None
 
 RELE_VPINS = {
     'PORTAO': 'v3',
@@ -147,10 +289,29 @@ ESTADO = {}
 
 # Inicialização da janela principal com tema ttkbootstrap
 root = tb.Window(themename="flatly")  # Tema mais claro e moderno
-root.title("Automação Residencial - Blynk")
-root.geometry("1100x700")
-root.minsize(600, 600)
-root.resizable(True, True)
+root.title("FSS AUTOMAÇÃO")
+root.geometry("1200x700")  # Aumentando altura inicial
+root.minsize(1100, 700)     # Aumentando tamanho mínimo
+root.resizable(True, True) # Permitindo redimensionamento
+
+# Tentar carregar ícone 'escudo.ico' (opcional). Não falha se não existir.
+try:
+    try:
+        ico_path = resource_path('escudo.ico')
+    except Exception:
+        ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'escudo.ico')
+    if os.path.exists(ico_path):
+        try:
+            root.iconbitmap(ico_path)
+        except Exception:
+            # fallback: tentar carregar como PhotoImage (algumas plataformas)
+            try:
+                _img = tk.PhotoImage(file=ico_path)
+                root.wm_iconphoto(False, _img)
+            except Exception:
+                pass
+except Exception:
+    pass
 
 # Configurar estilos para interface clara
 style = root.style
@@ -222,8 +383,43 @@ tb.Checkbutton(frame_tema, text="Alarmes Ativados", variable=alarme_ativo, boots
 # Checkbutton para ativar/desativar reconhecimento de gestos (opcional)
 gestos_ativos = tk.BooleanVar(value=False)
 gestos_label_text = tk.StringVar(value=("Gestos: disponível" if GESTURE_AVAILABLE else "Gestos: não disponível (instale mediapipe + opencv)"))
-tb.Checkbutton(frame_tema, text="Gestos Ativados", variable=gestos_ativos, bootstyle="info", width=14).pack(side='left', padx=10)
-tb.Label(frame_tema, textvariable=gestos_label_text, font=("Segoe UI", 9)).pack(side='left', padx=6)
+face_status_text = tk.StringVar(value=("Face: ativa" if FACE_DETECTION_AVAILABLE else "Face: não disponível"))
+
+# Frame para controles de gestos e face
+controls_row = tb.Frame(frame_tema)
+controls_row.pack(side='left', padx=10)
+
+# Checkbutton para gestos
+tb.Checkbutton(controls_row, text="Gestos Ativados", 
+               variable=gestos_ativos, 
+               bootstyle="info", 
+               width=14).pack(side='left')
+
+# Label para status dos gestos
+tb.Label(controls_row, 
+         textvariable=gestos_label_text, 
+         font=("Segoe UI", 9)).pack(side='left', padx=6)
+
+# Separador vertical
+tb.Separator(controls_row, orient='vertical').pack(side='left', padx=10, fill='y')
+
+# Label para status da face
+face_status_label = tb.Label(controls_row, 
+                            textvariable=face_status_text,
+                            font=("Segoe UI", 9, 'bold'))
+face_status_label.pack(side='left', padx=6)
+
+# Botão para adicionar usuário
+from user_manager import UserManager
+user_manager = UserManager(root, face_processor)
+
+tb.Button(
+    controls_row,
+    text="Adicionar Usuário",
+    command=lambda: user_manager.show_add_user_window(),
+    bootstyle="outline-primary",
+    width=15
+).pack(side='left', padx=10)
 # Checkbutton separado para abrir/fechar preview externo (janela separada)
 # Checkbutton separado para abrir/fechar preview externo (removido)
 # Checkbutton para desenhar landmarks (variável definida aqui)
@@ -260,8 +456,8 @@ tb.Combobox(frame_umid, values=RELES_LIST, textvariable=rele_alarme_umid, width=
 frame_plan = tb.Frame(frame_home)
 frame_plan.pack(fill='both', padx=10, pady=10)
 
-canvas_w = 520
-canvas_h = 360
+canvas_w = 520  # Tamanho original
+canvas_h = 360  # Tamanho original
 plan_canvas = tk.Canvas(frame_plan, width=canvas_w, height=canvas_h, bg='#f7f7f7', highlightthickness=1, highlightbackground='#cccccc')
 plan_canvas.pack(side='left', padx=10, pady=5)
 
@@ -297,24 +493,21 @@ def alternar_estado(vpin):
     if vpin == 'v10':
         novo_estado = 0 if any(ESTADO.get(r, 0) for r in ['v6','v7','v8','v9']) else 1
         for r in ['v6','v7','v8','v9']:
-            url = f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&{r}={novo_estado}"
             try:
-                requests.get(url)
+                safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, r: novo_estado})
             except Exception as e:
-                print("Erro ao enviar comando:", e)
-        url_mestre = f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&v10={novo_estado}"
+                print("Erro ao enviar comando:", _mask_token(str(e)))
         try:
-            requests.get(url_mestre)
+            safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, 'v10': novo_estado})
         except Exception as e:
-            print("Erro ao enviar comando para mestre:", e)
+            print("Erro ao enviar comando para mestre:", _mask_token(str(e)))
     else:
         estado_atual = ESTADO.get(vpin, 0)
         novo_estado = 0 if estado_atual == 1 else 1
         try:
-            url = f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&{vpin}={novo_estado}"
-            requests.get(url)
+            safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, vpin: novo_estado})
         except Exception as e:
-            print("Erro ao enviar comando:", e)
+            print("Erro ao enviar comando:", _mask_token(str(e)))
 
 # Cria botões de cada cômodo e posiciona sobre o canvas usando create_window
 botoes = {}
@@ -323,12 +516,12 @@ botoes = {}
 def _create_room_button(vpin, center_x, center_y):
     btn = tb.Button(plan_canvas,
                     text=f"{icones.get(label_por_vpin.get(vpin,''), '')}\n{label_por_vpin.get(vpin,'')}\nOFF",
-                    width=16,
+                    width=12,  # Reduzindo a largura do botão
                     bootstyle="danger",    # usa estilo do ttkbootstrap
                     cursor="hand2",
                     command=partial(alternar_estado, vpin))
     # cria widget dentro do canvas (o ttk.Button centraliza o texto por padrão)
-    plan_canvas.create_window(center_x, center_y, window=btn)
+    plan_canvas.create_window(center_x, center_y, window=btn, width=200, height=60)  # Definindo tamanho fixo
     botoes[vpin] = btn
 
 # Coordenadas centrais calculadas para cada cômodo
@@ -376,9 +569,6 @@ tb.Label(leg_frame, text="OFF", bootstyle="danger", anchor='center', width=6).gr
 preview_label = None
 preview_cap = None
 # Ajuste de tamanho padrão solicitado: 400 x 350
-# preview size defaults
-preview_width_var = tk.IntVar(value=400)
-preview_height_var = tk.IntVar(value=350)
 # seleção de índice da câmera
 camera_index_var = tk.IntVar(value=0)
 preview_hands = None
@@ -408,7 +598,13 @@ def start_preview_capture(camera_index=0):
     # criar objeto MediaPipe para preview/detecção, se disponível
     if GESTURE_AVAILABLE and mp is not None:
         try:
-            preview_hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.6)
+            # Configurar Hands com dimensões da imagem para evitar warning do landmark_projection
+            preview_hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=0.6,
+                model_complexity=0  # Usar modelo mais leve
+            )
         except Exception:
             preview_hands = None
     else:
@@ -463,7 +659,10 @@ def stop_preview_capture():
 
 
 def preview_loop():
-    """Loop chamado via root.after que captura um frame, atualiza previews e executa detecção leve."""
+    """
+    Loop que captura frames, processa detecção facial e gestos, 
+    e atualiza a interface gráfica.
+    """
     global preview_cap, preview_hands, gesture_hold_count, gesture_last_detected
     global current_gesture_var, current_action_var
 
@@ -480,8 +679,46 @@ def preview_loop():
 
         # Redimensionar frame para processamento mais rápido
         frame_small = cv2.resize(frame, (320, 240))
+        
+        # Verificar se há face antes de processar gestos
+        # Usar uma cópia para evitar que o FaceProcessor anote o frame original
+        # (assim mantemos a preview da Home limpa, apenas com nosso quadrado)
+        face_allowed = check_face_detection(frame_small.copy())
+        
+        # Converter para RGB primeiro
         rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
-        annotated = None
+        
+        # Se detectou face, desenha o quadrado verde
+        if face_allowed:
+            h, w = frame_small.shape[:2]
+            margin = 50  # margem do retângulo
+            x1, y1 = margin, margin
+            x2, y2 = w - margin, h - margin
+            # Desenhar apenas o quadrado verde quando detectar face
+            cv2.rectangle(rgb, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        annotated = rgb
+        
+        # Atualizar status da face na UI de forma simples
+        try:
+            if face_allowed:
+                face_status_text.set("Face Reconhecida")
+                face_status_label.configure(bootstyle="success")
+            else:
+                face_status_text.set("Aguardando...")
+                face_status_label.configure(bootstyle="danger")
+        except Exception:
+            pass
+            
+        if not face_allowed:
+            # Se não houver face autorizada, não processa gestos
+            if current_action_var is not None:
+                current_action_var.set('Posicione o rosto no quadrado')
+            if current_gesture_var is not None:
+                current_gesture_var.set('Aguardando face')
+            gesture_hold_count = 0
+            gesture_last_detected = None
+            detection_history.clear()
         
         detected = None
         # Processar landmarks apenas se preview_hands disponível
@@ -608,15 +845,15 @@ def close_preview_window():
 preview_row = tb.Frame(controls_frame)
 preview_row.pack(pady=(8,6))
 
-# Preview (pequeno) dentro da linha
-preview_small_frame = tb.Frame(preview_row, width=preview_width_var.get(), height=preview_height_var.get())
+# Preview (pequeno) dentro da linha - tamanho fixo 400x350
+preview_small_frame = tb.Frame(preview_row, width=400, height=350)
 preview_small_frame.pack(side='left')
 preview_small_frame.pack_propagate(False)
 preview_label = tk.Label(preview_small_frame, text="Preview\n(inativo)", bg="#000", fg="#fff")
 preview_label.pack(fill='both', expand=True)
 
 # Painel de debug ao lado do preview: mostra gesto detectado e ação tomada
-debug_frame = tb.Frame(preview_row, width=200, height=preview_height_var.get(), padding=6)
+debug_frame = tb.Frame(preview_row, width=200, height=350, padding=6)
 debug_frame.pack(side='left', padx=(8,0))
 debug_frame.pack_propagate(False)
 
@@ -637,16 +874,7 @@ tb.Label(debug_frame, text="Ação tomada:", font=("Segoe UI", 9)).pack(anchor='
 lbl_acao = tb.Label(debug_frame, textvariable=current_action_var, font=("Segoe UI", 10))
 lbl_acao.pack(anchor='w')
 
-# Controls para ajustar tamanho do preview (largura x altura)
-size_frame = tb.Frame(controls_frame)
-size_frame.pack(pady=(2,6))
-tb.Label(size_frame, text="Preview size:", font=("Segoe UI", 9)).pack(side='left', padx=(0,6))
-spin_w = tk.Spinbox(size_frame, from_=80, to=640, width=5, textvariable=preview_width_var)
-spin_w.pack(side='left')
-tk.Label(size_frame, text="x").pack(side='left')
-spin_h = tk.Spinbox(size_frame, from_=60, to=480, width=5, textvariable=preview_height_var)
-spin_h.pack(side='left', padx=(0,6))
-    # 'Desenhar landmarks' foi movido para a barra superior (frame_tema)
+# 'Desenhar landmarks' foi movido para a barra superior (frame_tema)
 
 # Nota: use apenas o Checkbutton 'Gestos Ativados' para abrir/fechar o preview.
 
@@ -657,28 +885,27 @@ tb.Label(cam_frame, text="Camera index:", font=("Segoe UI", 9)).pack(side='left'
 spin_idx = tk.Spinbox(cam_frame, from_=0, to=4, width=4, textvariable=camera_index_var)
 spin_idx.pack(side='left', padx=(4,8))
 
-# ligar trace para reagir a mudanças do índice e redimensionamento do preview
+# ligar trace para reagir a mudanças do índice da câmera
 camera_index_var.trace_add('write', lambda *a: _on_camera_index_change())
-preview_width_var.trace_add('write', lambda *a: preview_small_frame.config(width=int(preview_width_var.get())))
-preview_height_var.trace_add('write', lambda *a: preview_small_frame.config(height=int(preview_height_var.get())))
 
 # --- Funções principais ---
 def obter_dados():
     if not root.winfo_exists():
         return
     try:
-        # Usar session para reutilizar conexões HTTP
+        # Usar session para reutilizar conexões HTTP e passar token via params
         with requests.Session() as session:
-            resposta = session.get(BLYNK_URL_GET, timeout=5)
-            if resposta.status_code == 200:
+            resposta = session.get(BLYNK_URL_GET, params={'token': BLYNK_TOKEN}, timeout=5)
+            if resposta is not None and resposta.status_code == 200:
                 dados = resposta.json()
-                atualizar_interface(dados)                     
+                atualizar_interface(dados)
             else:
-                print(f"Erro ao obter dados: {resposta.status_code}")
+                status = resposta.status_code if resposta is not None else 'N/A'
+                print(f"Erro ao obter dados: {status}")
     except requests.RequestException as e:
-        print(f"Erro de conexão: {e}")
+        print(f"Erro de conexão: {_mask_token(str(e))}")
     except Exception as e:
-        print(f"Erro: {e}")
+        print(f"Erro: {_mask_token(str(e))}")
     finally:
         # Só agenda próxima execução se a janela ainda existir
         if root.winfo_exists():
@@ -694,19 +921,18 @@ def atualizar_interface(dados):
     
     t = _to_float(temperatura)
     if t is not None:
-        # tc é o valor real da temperatura (24.5)
-        tc = max(0.0, min(100.0, t)) 
-
-        # >>> CORREÇÃO: Inverter o valor para compensar o bug de inversão no DialGauge
-         # Se o gauge está mostrando 100 - tc, precisamos enviar 100 - (100 - tc) para que a inversão dê o valor correto.
-        tc_inverted = 100.0 - tc
+        # tc é o valor real da temperatura (ex: 24.5°C)
+        tc = max(100.0, min(0.0, t))  # Limita entre 0 e 50°C
             
-        # Atualiza o label abaixo do gauge com o valor real
+        # Normaliza o valor real (0-50°C) para a escala visual do gauge (0-100)
+        tc_normalized = (tc / 50.0) * 100.0
+            
+        # Atualiza o label abaixo do gauge com o valor real em °C
         temp_value_var.set(f"{tc:.1f} °C") 
 
         if temp_gauge:
-            # Passa o valor invertido. O gauge (invertido) irá exibi-lo corretamente como 24.5.
-            temp_gauge.update(tc_inverted) # Corrigido para tc_inverted     
+            # Atualiza o gauge com o valor normalizado (0-100)
+            temp_gauge.update(tc_normalized)
 
     # Atualiza os gauges (se existirem) com os valores numéricos
     parsed_temp_val = None
@@ -721,7 +947,7 @@ def atualizar_interface(dados):
             # --- CORREÇÃO: Salvar 'tc' (real) no histórico ---
             try:
                 temp_history.append(tc) 
-                temp_normalized = (tc - 15.0) * (100.0 / 30.0)  # Valor normalizado (ex: 29.0)
+                #temp_normalized = (tc / 100.0) * 100.0
             except Exception:
                 temp_normalized = None
                 
@@ -859,9 +1085,8 @@ def acionar_rele_alarme(nome_rele):
         return
     vpin = RELE_VPINS.get(nome_rele)
     if vpin and ESTADO.get(vpin, 0) == 0:
-        url = f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&{vpin}=1"
         try:
-            requests.get(url)
+            safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, vpin: 1})
         except:
             pass
         
@@ -1014,13 +1239,16 @@ def start_alarm_sound(filename='alarme.mp3'):
         return
 
     if not os.path.isabs(filename):
+        # resolve caminho usando resource_path (compatível com PyInstaller)
         try:
-            # Tenta encontrar o caminho base do script
-            base = os.path.dirname(__file__)
-        except NameError:
-            # Fallback se __file__ não estiver definido (ex: REPL)
-            base = os.getcwd()
-        filename = os.path.join(base, filename)
+            filename = resource_path(filename)
+        except Exception:
+            # fallback simples
+            try:
+                base = os.path.dirname(__file__)
+            except NameError:
+                base = os.getcwd()
+            filename = os.path.join(base, filename)
 
 
     # pygame (melhor opção)
@@ -1042,7 +1270,7 @@ def start_alarm_sound(filename='alarme.mp3'):
             if not os.path.exists(filename):
                 print(f"Erro Winsound: Arquivo de alarme não encontrado em {filename}")
                 return
-            # winsound requer WAV; se não for WAV, tenta tocar de qualquer forma (pode falhar)
+            # winsound requer WAV; se não for WAV, tenta tocar de qualquer forma
             winsound.PlaySound(filename, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
             sound_playing = True
             return
@@ -1102,7 +1330,7 @@ def trigger_gesture_action(fingers_count):
             print("Gesto: POLEGAR -> alternando PORTAO (v3)")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET PORTAO')
+                    current_action_var.set('PORTAO')
             except Exception:
                 pass
             return
@@ -1111,17 +1339,17 @@ def trigger_gesture_action(fingers_count):
         if fingers_count == 5:
             for r in ['v6','v7','v8','v9']:
                 try:
-                    requests.get(f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&{r}=1")
+                    safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, r: 1})
                 except Exception:
                     pass
             try:
-                requests.get(f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&v10=1")
+                safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, 'v10': 1})
             except Exception:
                 pass
             print("Gesto: 5 dedos -> Mestre ON")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET Mestre ON')
+                    current_action_var.set('Mestre ON')
             except Exception:
                 pass
             return
@@ -1130,28 +1358,28 @@ def trigger_gesture_action(fingers_count):
         if fingers_count == 0:
             for r in ['v6','v7','v8','v9']:
                 try:
-                    requests.get(f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&{r}=0")
+                    safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, r: 0})
                 except Exception:
                     pass
             try:
-                requests.get(f"{BLYNK_URL_SET}?token={BLYNK_TOKEN}&v10=0")
+                safe_get(BLYNK_URL_SET, params={'token': BLYNK_TOKEN, 'v10': 0})
             except Exception:
                 pass
             print("Gesto: 0 dedos -> Mestre OFF e relés v6,v7,v8,v9 desligados")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET Mestre OFF')
+                    current_action_var.set('Mestre OFF')
             except Exception:
                 pass
             return
 
-        # Mapear contagens para relés individuais conforme solicitado
+        # Mapa contagens para relés individuais
         if fingers_count == 1:
             alternar_estado('v7')  # 1 dedo -> QUARTO (v7)
             print("Gesto: 1 dedo -> alterna QUARTO (v7)")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET QUARTO')
+                    current_action_var.set('QUARTO')
             except Exception:
                 pass
             return
@@ -1160,7 +1388,7 @@ def trigger_gesture_action(fingers_count):
             print("Gesto: 2 dedos -> alterna SALA (v6)")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET SALA')
+                    current_action_var.set('SALA')
             except Exception:
                 pass
             return
@@ -1169,7 +1397,7 @@ def trigger_gesture_action(fingers_count):
             print("Gesto: 3 dedos -> alterna CORREDOR (v8)")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET CORREDOR')
+                    current_action_var.set('CORREDOR')
             except Exception:
                 pass
             return
@@ -1178,7 +1406,7 @@ def trigger_gesture_action(fingers_count):
             print("Gesto: 4 dedos -> alterna GARAGEM (v9)")
             try:
                 if current_action_var is not None:
-                    current_action_var.set('SET GARAGEM')
+                    current_action_var.set('GARAGEM')
             except Exception:
                 pass
             return
@@ -1190,7 +1418,7 @@ def _gesture_count_fingers(hand_landmarks, handedness):
     """Conta dedos estendidos com base em landmarks do MediaPipe."""
     # Constantes para otimização
     THUMB_DIST_THRESHOLD = 0.1
-    FINGER_EXTENSION_THRESHOLD = 0.05
+    FINGER_EXTENSION_THRESHOLD = 0.03
     tips_ids = (4, 8, 12, 16, 20)  # pontas dos dedos (tupla é mais rápida que lista)
     pips_ids = (2, 6, 10, 14, 18)  # articulações intermediárias
     
@@ -1236,13 +1464,8 @@ def _update_preview_image_from_bgr(bgr_frame):
         # converte BGR -> RGB
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
-        # redimensionar para caber no label (usar valores do spinbox)
-        try:
-            w = int(preview_width_var.get())
-            h = int(preview_height_var.get())
-        except Exception:
-            w, h = 220, 160
-        img.thumbnail((w, h))
+        # redimensionar para tamanho fixo 400x350
+        img.thumbnail((400, 350))
         imgtk = ImageTk.PhotoImage(image=img)
 
         def _setimg():
@@ -1347,14 +1570,18 @@ gauge_frame.pack(expand=True, fill='both', padx=20, pady=20)
 top_values_row = tb.Frame(gauge_frame)
 top_values_row.pack(fill='x', pady=(0,12))
 
-# Temperatura (à esquerda) — usar LabelFrame parecido com a aba Home, sem setpoint/relés
-temp_dashboard_frame = tb.LabelFrame(top_values_row, text="Temperatura", bootstyle="secondary", padding=6)
-temp_dashboard_frame.pack(side='left', expand=True, fill='x', padx=(0,8))
+# Frame para os gauges com tamanho fixo para garantir espaço suficiente
+gauge_container = tb.Frame(gauge_frame, height=320)  # Altura fixa para os gauges
+gauge_container.pack(fill='x', expand=True)
+gauge_container.pack_propagate(False)  # Impede que o frame encolha
+
+# Frames laterais para os gauges com tamanho fixo
+temp_dashboard_frame = tb.LabelFrame(gauge_container, text="Temperatura", bootstyle="secondary", padding=10)
+temp_dashboard_frame.pack(side='left', expand=True, fill='both', padx=(0,8))
 tb.Label(temp_dashboard_frame, textvariable=temperatura_var, font=("Segoe UI", 14, 'bold'), bootstyle="warning").pack(anchor='w')
 
-# Umidade (à direita) — LabelFrame como na Home
-umid_dashboard_frame = tb.LabelFrame(top_values_row, text="Umidade", bootstyle="secondary", padding=6)
-umid_dashboard_frame.pack(side='right', expand=True, fill='x', padx=(8,0))
+umid_dashboard_frame = tb.LabelFrame(gauge_container, text="Umidade", bootstyle="secondary", padding=10)
+umid_dashboard_frame.pack(side='right', expand=True, fill='both', padx=(8,0))
 tb.Label(umid_dashboard_frame, textvariable=umidade_var, font=("Segoe UI", 14, 'bold'), bootstyle="info").pack(anchor='e')
 
 # Frame interno para alinhar os gauges horizontalmente no centro
@@ -1438,16 +1665,13 @@ except ImportError:
             self.canvas = DialGauge._DummyCanvas(self._w)
         def update(self, val):
             pass
-
-
-# Instanciar gauges tipo velocímetro para Temperatura e Umidade
-# Colocar cada gauge dentro do seu LabelFrame respectivo (Dashboard)
-# Assim os gauges ficam próximos aos valores/controles correspondentes
-
-temp_gauge = DialGauge(temp_dashboard_frame, 'Temperatura', 0, 0, 50, color='#c00000', size=220, unit=' °C', invert=True)
+        
+# Gauges de temperatura e umidade
+temp_gauge = DialGauge(temp_dashboard_frame, 'Temperatura', 0, 0, 50, color="#7f0000", unit=' °C', size=280, invert=False)  
 temp_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
 
-umid_gauge = DialGauge(umid_dashboard_frame, 'Umidade', 0, 0, 100, color='#007f00', size=220, unit=' %', invert=False)
+umid_gauge = DialGauge(umid_dashboard_frame, 'Umidade', 0, 0, 100, 
+                      color='#007f00', unit=' %', size=280, invert=False)
 umid_gauge.canvas.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(6,4))
 
 # Labels de valor em tempo real (numérico) abaixo de cada gauge (opcional, duplicado com o texto interno)
@@ -1458,7 +1682,7 @@ except Exception:
     temp_value_var = None
     umid_value_var = None
 
-# Colocar os labels dentro dos frames dos gauges para alinhamento
+# Labels dentro dos frames dos gauges para alinhamento
 try:
     if temp_value_var is not None:
         tb.Label(temp_gauge.canvas.get_tk_widget(), textvariable=temp_value_var,
@@ -1598,7 +1822,22 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
         def _map_points(data, min_val, max_val):
             if not data:
                 return []
-            n = len(data)
+                
+            # Filtrar valores None e inválidos
+            valid_data = []
+            for val in data:
+                try:
+                    if val is not None:
+                        fval = float(val)
+                        if min_val <= fval <= max_val:
+                            valid_data.append(fval)
+                except (TypeError, ValueError):
+                    continue
+            
+            if not valid_data:
+                return []
+                
+            n = len(valid_data)
             span = max_val - min_val
             if span <= 0:
                 span = 1
@@ -1611,14 +1850,12 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
             pts = []
             append = pts.append  # Cache método append
             
-            for i, val in enumerate(data):
-                try:
-                    x = left + i * x_factor
-                    normalized_val = (float(val) - min_val) / span
-                    y = top + (1.0 - max(0, min(1.0, normalized_val))) * y_factor
-                    append((x, y))
-                except (TypeError, ValueError):
-                    continue
+            for i, val in enumerate(valid_data):
+                x = left + i * x_factor
+                normalized_val = (val - min_val) / span
+                y = top + (1.0 - max(0, min(1.0, normalized_val))) * y_factor
+                append((x, y))
+            
             return pts
 
         # Mapear pontos uma única vez para cada série
@@ -1626,12 +1863,19 @@ def _draw_combined_chart(canvas, temp_data, umid_data):
         u_pts = _map_points(umid_data, 0.0, 100.0)
 
         # Desenhar linhas em batch
-        if t_pts:
+        if len(t_pts) >= 2:  # Precisa de pelo menos 2 pontos para uma linha
             canvas.create_line(*[coord for p in t_pts for coord in p],
                              fill='#c00000', width=2, smooth=True)
-        if u_pts:
+        elif len(t_pts) == 1:  # Se tiver apenas um ponto, desenha um ponto
+            x, y = t_pts[0]
+            canvas.create_oval(x-2, y-2, x+2, y+2, fill='#c00000', outline='#c00000')
+
+        if len(u_pts) >= 2:  # Precisa de pelo menos 2 pontos para uma linha
             canvas.create_line(*[coord for p in u_pts for coord in p],
                              fill='#007f00', width=2, smooth=True)
+        elif len(u_pts) == 1:  # Se tiver apenas um ponto, desenha um ponto
+            x, y = u_pts[0]
+            canvas.create_oval(x-2, y-2, x+2, y+2, fill='#007f00', outline='#007f00')
 
         # Otimizar rótulos de tempo
         if temp_data:
@@ -1730,6 +1974,8 @@ def _on_close():
 
 root.protocol("WM_DELETE_WINDOW", _on_close)
 
+
+# Nada a carregar para detecção facial simples
 
 if __name__ == '__main__':
     try:
